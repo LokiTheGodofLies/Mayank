@@ -5,37 +5,52 @@ from database.connection import db
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-async def save_channel(channel_id: int, channel_name: str, username: str | None) -> bool:
-    """Saves or updates a channel in the channels_database collection."""
-    if db is None:
-        return False
-
+async def save_channel(
+    channel_id: int,
+    channel_name: str,
+    username: str | None,
+    invite_link: str | None = None,
+    status: str = "active",
+) -> dict:
+    """Saves or updates a channel in the channels_database collection and returns the stored record."""
     now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    collection = db["channels_database"]
     formatted_username = f"@{username}" if username else None
 
+    if db is None:
+        return {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "username": formatted_username,
+            "invite_link": invite_link,
+            "status": status,
+        }
+
+    collection = db["channels_database"]
     existing = await collection.find_one({"channel_id": channel_id})
+
+    # Keep the previously saved invite link if a new one isn't available (e.g., when removed)
+    final_invite_link = invite_link or (existing.get("invite_link") if existing else None)
+
     if existing is None:
-        await collection.insert_one(
-            {
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "username": formatted_username,
-                "added_at": now_str,
-                "updated_at": now_str,
-            }
-        )
-        return True
+        record = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "username": formatted_username,
+            "invite_link": final_invite_link,
+            "status": status,
+            "added_at": now_str,
+            "updated_at": now_str,
+        }
+        await collection.insert_one(record)
+        return record
     else:
-        await collection.update_one(
-            {"channel_id": channel_id},
-            {
-                "$set": {
-                    "channel_name": channel_name,
-                    "username": formatted_username,
-                    "updated_at": now_str,
-                }
-            },
-        )
-        return False
-      
+        update_fields = {
+            "channel_name": channel_name,
+            "username": formatted_username,
+            "invite_link": final_invite_link,
+            "status": status,
+            "updated_at": now_str,
+        }
+        await collection.update_one({"channel_id": channel_id}, {"$set": update_fields})
+        existing.update(update_fields)
+        return existing
