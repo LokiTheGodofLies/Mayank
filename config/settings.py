@@ -28,6 +28,8 @@ ADMIN_IDS = parse_id_list(os.getenv("ADMIN_IDS", ""))
 # Log Group & Forum Topic IDs
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
 USER_LOG_TOPIC_ID = int(os.getenv("USER_LOG_TOPIC_ID", "0"))
+CHANNEL_LOG_TOPIC_ID = int(os.getenv("CHANNEL_LOG_TOPIC_ID", "0"))
+GROUP_LOG_TOPIC_ID = int(os.getenv("GROUP_LOG_TOPIC_ID", "0"))
 
 # Render Web Service Port
 PORT = int(os.getenv("PORT", "8080"))
