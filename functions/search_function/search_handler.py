@@ -3,8 +3,7 @@ import html
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import Message
 
-from database.files_database.files_db import format_file_size
-from database.scripts_database.scripts_db import search_indexed_files
+from database.files_database.files_db import format_file_size, search_files
 
 
 def register_search_handler(bot: AsyncTeleBot) -> None:
@@ -25,7 +24,7 @@ def register_search_handler(bot: AsyncTeleBot) -> None:
             )
             return
 
-        results, total_count, _ = await search_indexed_files(query=query, page=1, per_page=5)
+        results, total_count = await search_files(query=query, limit=5, skip=0)
         if not results:
             await bot.reply_to(
                 message,
