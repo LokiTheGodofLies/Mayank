@@ -1,100 +1,143 @@
+import asyncio
 import html
 import os
+import sys
+
+import aiohttp
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import Message
+
 import config.settings as settings
-from database.config_database.config_db import (
-    set_config_var,
-    get_all_config_vars,
-    delete_config_var,
+from functions.error_logger.error_log_sender import (
+    send_deployment_log,
+    send_missing_var_log,
+    send_error_log,
 )
-
-# Keys that are displayed when running /getvars
-TRACKED_KEYS = [
-    "API_ID",
-    "OWNER_IDS",
-    "ADMIN_IDS",
-    "LOG_GROUP_ID",
-    "USER_LOG_TOPIC_ID",
-    "GROUP_LOG_TOPIC_ID",
-    "CHANNEL_LOG_TOPIC_ID",
-    "DATABASE_NAME",
-    "RENDER_DEPLOY_HOOK_URL",
-]
+from functions.permissions import require_owner
 
 
-async def process_setvar(bot: AsyncTeleBot, message: Message) -> None:
-    """Handles /setvar KEY VALUE to update an environment variable and save it in MongoDB."""
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await bot.reply_to(
-            message,
-            "<b>Usage:</b> <code>/setvar KEY VALUE</code>\n"
-            "<b>Example:</b> <code>/setvar USER_LOG_TOPIC_ID 12</code>",
-            parse_mode="HTML",
-        )
+def format_owner_mention(message: Message) -> str:
+    """Formats a clickable HTML mention of the Owner who triggered the action."""
+    user = getattr(message, "from_user", None)
+    if not user:
+        return "Owner"
+    name = html.escape(getattr(user, "full_name", None) or getattr(user, "first_name", "Owner"))
+    return f'<a href="tg://user?id={user.id}">{name}</a> (<code>{user.id}</code>)'
+
+
+async def process_restart(bot: AsyncTeleBot, message: Message) -> None:
+    """Logs the restart to Topic 35, notifies the Owner, and restarts the Python process."""
+    if not await require_owner(bot, message):
         return
 
-    key = parts[1].strip().upper()
-    value = parts[2].strip()
-
-    await set_config_var(key, value)
-    settings.apply_config_overrides({key: value})
-
+    owner_mention = format_owner_mention(message)
     await bot.reply_to(
         message,
-        f"✅ Variable <code>{html.escape(key)}</code> updated to:\n"
-        f"<code>{html.escape(value)}</code>\n\n"
-        f"<i>Saved in MongoDB. Use /restart to apply across all modules immediately.</i>",
+        "🔄 <b>Restarting bot in 2 seconds...</b>",
         parse_mode="HTML",
     )
 
+    await send_deployment_log(
+        bot=bot,
+        event_type="Manual Process Restart (/restart)",
+        status_text="Bot process is restarting via os.execv...",
+        is_error=False,
+        triggered_by=owner_mention,
+    )
 
-async def process_getvars(bot: AsyncTeleBot, message: Message) -> None:
-    """Handles /getvars to list active configuration variables and MongoDB overrides."""
-    db_overrides = await get_all_config_vars()
-    all_keys = list(dict.fromkeys(TRACKED_KEYS + list(db_overrides.keys())))
-
-    lines = ["<b>⚙️ Current Bot Variables:</b>\n"]
-    for key in all_keys:
-        val = os.getenv(key, "")
-        source = "MongoDB Override" if key in db_overrides else "Render Env"
-        # Mask sensitive keys if someone checks them in a group
-        if key in ("BOT_TOKEN", "API_HASH", "MONGO_URL") and val:
-            display_val = val[:6] + "..." + val[-4:]
-        else:
-            display_val = val if val else "Not Set"
-        lines.append(
-            f"• <b>{html.escape(key)}:</b> <code>{html.escape(display_val)}</code> <i>({source})</i>"
-        )
-
-    await bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+    await asyncio.sleep(2)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-async def process_delvar(bot: AsyncTeleBot, message: Message) -> None:
-    """Handles /delvar KEY to remove a MongoDB override."""
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
+async def process_redeploy(bot: AsyncTeleBot, message: Message) -> None:
+    """Triggers a Render cloud rebuild via RENDER_DEPLOY_HOOK_URL and logs status to Topic 35."""
+    if not await require_owner(bot, message):
+        return
+
+    owner_mention = format_owner_mention(message)
+    hook_url = (getattr(settings, "RENDER_DEPLOY_HOOK_URL", "") or "").strip()
+
+    if not hook_url:
         await bot.reply_to(
             message,
-            "<b>Usage:</b> <code>/delvar KEY</code>\n"
-            "<b>Example:</b> <code>/delvar USER_LOG_TOPIC_ID</code>",
+            "⚠️ <b>RENDER_DEPLOY_HOOK_URL is not configured!</b>\n"
+            "Set it using: <code>/setvar RENDER_DEPLOY_HOOK_URL &lt;url&gt;</code>",
             parse_mode="HTML",
+        )
+        await send_missing_var_log(
+            bot=bot,
+            missing_vars=["RENDER_DEPLOY_HOOK_URL"],
+            context_action="/redeploy Command",
         )
         return
 
-    key = parts[1].strip().upper()
-    deleted = await delete_config_var(key)
-    if deleted:
-        await bot.reply_to(
-            message,
-            f"🗑 Removed MongoDB override for <code>{html.escape(key)}</code>.\n"
-            f"<i>Send /restart to revert to the default Render variable.</i>",
+    status_msg = await bot.reply_to(
+        message,
+        "🚀 <b>Triggering Render cloud redeploy...</b>",
+        parse_mode="HTML",
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(hook_url, timeout=15) as resp:
+                resp_text = await resp.text()
+                if resp.status in (200, 201, 202):
+                    await bot.edit_message_text(
+                        "✅ <b>Render redeploy triggered!</b>\n"
+                        "Render is now building and deploying your latest commit.",
+                        chat_id=status_msg.chat.id,
+                        message_id=status_msg.message_id,
+                        parse_mode="HTML",
+                    )
+                    await send_deployment_log(
+                        bot=bot,
+                        event_type="Render Cloud Redeploy (/redeploy)",
+                        status_text=f"Webhook Accepted (HTTP {resp.status}) - New deployment started.",
+                        is_error=False,
+                        triggered_by=owner_mention,
+                    )
+                else:
+                    await bot.edit_message_text(
+                        f"❌ <b>Render redeploy failed!</b> (HTTP <code>{resp.status}</code>)",
+                        chat_id=status_msg.chat.id,
+                        message_id=status_msg.message_id,
+                        parse_mode="HTML",
+                    )
+                    await send_deployment_log(
+                        bot=bot,
+                        event_type="Render Cloud Redeploy Failed (/redeploy)",
+                        status_text=f"HTTP {resp.status}: {resp_text[:300]}",
+                        is_error=True,
+                        triggered_by=owner_mention,
+                    )
+    except Exception as e:
+        await bot.edit_message_text(
+            f"❌ <b>Error triggering Render webhook:</b> <code>{html.escape(str(e))}</code>",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
             parse_mode="HTML",
         )
-    else:
-        await bot.reply_to(
-            message,
-            f"ℹ️ No MongoDB override found for <code>{html.escape(key)}</code>.",
-            parse_mode="HTML",
+        await send_error_log(
+            bot=bot,
+            action="/redeploy Webhook Request",
+            error=e,
+            chat_title=getattr(message.chat, "title", "Private Chat"),
+            chat_id=message.chat.id,
+            user_name=getattr(message.from_user, "full_name", "Owner"),
+            user_id=message.from_user.id,
         )
+
+
+def register_redeploy_handler(bot: AsyncTeleBot) -> None:
+    """Registers /restart and /redeploy commands for Bot Owners."""
+
+    @bot.message_handler(commands=["restart"])
+    async def handle_restart_cmd(message: Message):
+        await process_restart(bot, message)
+
+    @bot.message_handler(commands=["redeploy"])
+    async def handle_redeploy_cmd(message: Message):
+        await process_redeploy(bot, message)
+
+
+__all__ = ["register_redeploy_handler", "process_restart", "process_redeploy"]
