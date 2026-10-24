@@ -1,8 +1,12 @@
 import asyncio
 import html
 import re
+from typing import Any
+
 from telebot.async_telebot import AsyncTeleBot
+from telebot.apihelper import ApiTelegramException
 from telebot.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
 import config.settings as settings
 from config.strings import DEFAULT_SCRIPTS
 from database.files_database.files_db import (
@@ -29,6 +33,10 @@ MIME_TO_EXT = {
     "audio/x-m4a": "m4b",
     "audio/vnd.audible.aax": "aax",
 }
+
+_INDEX_BATCH_SIZE = 10
+_INDEX_BATCH_COOLDOWN_SECONDS = 10
+_INDEX_FORWARD_DELAY_SECONDS = 3
 
 _BOT_ID_CACHE: int | None = None
 
@@ -57,6 +65,27 @@ async def is_bot_admin_in_chat(bot: AsyncTeleBot, chat_id: int) -> bool:
         return False
 
 
+async def wait_for_flood_or_retry(exc: Exception, *, default_wait: int = 5) -> bool:
+    """Handles Telegram 429 flood-wait responses without crashing the batch loop."""
+    if not isinstance(exc, ApiTelegramException):
+        return False
+
+    text = str(exc).lower()
+    if "flood" not in text and "retry after" not in text and "too many requests" not in text and "429" not in text:
+        return False
+
+    retry_after = default_wait
+    match = re.search(r"retry after\s+(\d+)", text, re.IGNORECASE)
+    if match:
+        try:
+            retry_after = max(1, int(match.group(1)))
+        except ValueError:
+            retry_after = default_wait
+
+    await asyncio.sleep(retry_after)
+    return True
+
+
 async def verify_msg_exists_in_index_channel(bot: AsyncTeleBot, index_channel_id: int, db_message_id: int | None) -> bool:
     """
     Verifies whether a previously indexed message ID still exists inside INDEX_CHANNEL_ID.
@@ -65,8 +94,6 @@ async def verify_msg_exists_in_index_channel(bot: AsyncTeleBot, index_channel_id
     if not db_message_id or not index_channel_id:
         return False
     try:
-        # Attempt a non-destructive reaction/unpin or forward check via get_chat/copy check
-        # Using set_message_reaction with empty reaction list verifies message existence without creating any new post
         await bot.set_message_reaction(
             chat_id=int(index_channel_id),
             message_id=int(db_message_id),
@@ -77,7 +104,6 @@ async def verify_msg_exists_in_index_channel(bot: AsyncTeleBot, index_channel_id
         err_str = str(e).upper()
         if "MESSAGE_ID_INVALID" in err_str or "MESSAGE TO REACT NOT FOUND" in err_str or "MESSAGE NOT FOUND" in err_str:
             return False
-        # If reaction API is disabled in the channel, assume existing message is valid
         return True
 
 
@@ -187,7 +213,6 @@ async def process_single_file_dual_check(
     is_direct_upload = (int(chat_id) == int(index_channel_id))
     existing_doc = await is_file_already_indexed(media_info["file_unique_id"])
 
-    # Dual-Check Case 1: Exists in MongoDB -> Check if it also still exists in INDEX_CHANNEL_ID
     if existing_doc:
         recorded_msg_id = existing_doc.get("db_message_id")
         if is_direct_upload:
@@ -201,7 +226,6 @@ async def process_single_file_dual_check(
         if still_in_channel:
             return "duplicate"
 
-        # Missing from INDEX_CHANNEL_ID (deleted from channel) -> Re-forward and update MongoDB
         try:
             forwarded_msg = await bot.forward_message(
                 chat_id=int(index_channel_id),
@@ -218,6 +242,8 @@ async def process_single_file_dual_check(
             )
             return "forwarded"
         except Exception as e:
+            if await wait_for_flood_or_retry(e):
+                return "error"
             await send_bot_not_admin_log(
                 bot=bot,
                 chat_title=getattr(message.chat, "title", "Chat"),
@@ -228,14 +254,11 @@ async def process_single_file_dual_check(
             )
             return "error"
 
-    # Dual-Check Case 2 & 3: Missing from MongoDB
     db_channel_username = None
     if is_direct_upload:
-        # Case 3: Already in INDEX_CHANNEL_ID, only missing from MongoDB -> Save without duplicating post
         db_message_id = message.message_id
         db_channel_username = getattr(message.chat, "username", None)
     else:
-        # Case 2: Missing from both -> Forward to INDEX_CHANNEL_ID and save to MongoDB
         try:
             forwarded_msg = await bot.forward_message(
                 chat_id=int(index_channel_id),
@@ -249,6 +272,8 @@ async def process_single_file_dual_check(
             if forwarded_media and getattr(forwarded_media, "file_id", None):
                 media_info["file_id"] = forwarded_media.file_id
         except Exception as e:
+            if await wait_for_flood_or_retry(e):
+                return "error"
             await send_bot_not_admin_log(
                 bot=bot,
                 chat_title=getattr(message.chat, "title", "Chat"),
@@ -367,6 +392,114 @@ def parse_chat_and_msg_link(link_or_id: str) -> tuple[int | str | None, int | No
     return text, None
 
 
+async def process_index_batch(
+    bot: AsyncTeleBot,
+    *,
+    source_chat_id: int | str,
+    last_msg_id: int,
+    skip_msg_id: int = 0,
+    filter_topic_id: int | None = None,
+    chat_obj: Any | None = None,
+    resolved_chat_id: int | str | None = None,
+    log_group_id: int | None = None,
+    status_msg: Message | None = None,
+    job_id: int | None = None,
+) -> dict:
+    """Safely batches indexing with a max burst of 10 items and cooldown windows to avoid Telegram rate limits."""
+    stats = {
+        "total_messages": last_msg_id,
+        "fetched": 0,
+        "remaining": last_msg_id,
+        "forwarded": 0,
+        "duplicate": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "filtered": 0,
+    }
+
+    if status_msg is None or job_id is None:
+        return stats
+
+    probe_chat_id = int(log_group_id) if log_group_id else getattr(status_msg.chat, "id", 0)
+
+    for msg_id in range(1, last_msg_id + 1):
+        job_state = ACTIVE_INDEX_JOBS.get(job_id)
+        if not job_state or job_state.get("cancelled"):
+            break
+
+        while job_state.get("paused") and not job_state.get("cancelled"):
+            await asyncio.sleep(1.5)
+            job_state = ACTIVE_INDEX_JOBS.get(job_id)
+            if not job_state:
+                break
+
+        if not job_state or job_state.get("cancelled"):
+            break
+
+        stats["fetched"] += 1
+        stats["remaining"] = last_msg_id - stats["fetched"]
+
+        if msg_id <= skip_msg_id:
+            stats["skipped"] += 1
+            continue
+
+        try:
+            probed_msg = await bot.forward_message(
+                chat_id=probe_chat_id,
+                from_chat_id=resolved_chat_id,
+                message_id=msg_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            if await wait_for_flood_or_retry(e):
+                continue
+            err_u = str(e).upper()
+            if "MESSAGE TO FORWARD NOT FOUND" in err_u or "MESSAGE_ID_INVALID" in err_u:
+                stats["deleted"] += 1
+            else:
+                stats["filtered"] += 1
+            continue
+
+        try:
+            await bot.delete_message(chat_id=probe_chat_id, message_id=probed_msg.message_id)
+        except Exception:
+            pass
+
+        if filter_topic_id is not None and getattr(probed_msg, "message_thread_id", None) != filter_topic_id:
+            stats["skipped"] += 1
+            continue
+
+        probed_msg.chat = chat_obj
+        probed_msg.message_id = msg_id
+
+        outcome = await process_single_file_dual_check(bot, probed_msg, send_log=True)
+        if outcome == "forwarded":
+            stats["forwarded"] += 1
+        elif outcome == "duplicate":
+            stats["duplicate"] += 1
+        else:
+            stats["filtered"] += 1
+
+        if stats["fetched"] % _INDEX_BATCH_SIZE == 0 and msg_id != last_msg_id:
+            await asyncio.sleep(_INDEX_BATCH_COOLDOWN_SECONDS)
+        else:
+            await asyncio.sleep(_INDEX_FORWARD_DELAY_SECONDS)
+
+        if stats["fetched"] % 15 == 0 or stats["fetched"] == last_msg_id:
+            try:
+                await bot.edit_message_text(
+                    text=render_progress_box(stats, status_label="forwarding", footer_label="ᴘʀᴏɢʀᴇssɪɴɢ"),
+                    chat_id=status_msg.chat.id,
+                    message_id=job_id,
+                    parse_mode="HTML",
+                    reply_markup=build_batch_control_keyboard(job_id, is_paused=job_state.get("paused", False)),
+                )
+            except Exception:
+                pass
+
+    return stats
+
+
 def register_indexer_handler(bot: AsyncTeleBot) -> None:
     """Registers live indexing handlers and the batch /index command + Pause/Cancel callbacks."""
 
@@ -404,7 +537,6 @@ def register_indexer_handler(bot: AsyncTeleBot) -> None:
         skip_msg_id = 0
         filter_topic_id = None
 
-        # Support replying /index [skip_msg_id] [topic_id] to a forwarded message
         if message.reply_to_message and getattr(message.reply_to_message, "forward_from_chat", None):
             source_chat_id = message.reply_to_message.forward_from_chat.id
             last_msg_id = message.reply_to_message.forward_from_message_id
@@ -468,23 +600,21 @@ def register_indexer_handler(bot: AsyncTeleBot) -> None:
             )
             return
 
-        stats = {
-            "total_messages": last_msg_id,
-            "fetched": 0,
-            "remaining": last_msg_id,
-            "forwarded": 0,
-            "duplicate": 0,
-            "deleted": 0,
-            "skipped": 0,
-            "filtered": 0,
-        }
-
-        initial_text = render_progress_box(stats, status_label="forwarding", footer_label="ᴘʀᴏɢʀᴇssɪɴɢ")
-        status_msg = await bot.reply_to(
-            message,
-            initial_text,
-            parse_mode="HTML",
+        initial_text = render_progress_box(
+            {
+                "total_messages": last_msg_id,
+                "fetched": 0,
+                "remaining": last_msg_id,
+                "forwarded": 0,
+                "duplicate": 0,
+                "deleted": 0,
+                "skipped": 0,
+                "filtered": 0,
+            },
+            status_label="forwarding",
+            footer_label="ᴘʀᴏɢʀᴇssɪɴɢ",
         )
+        status_msg = await bot.reply_to(message, initial_text, parse_mode="HTML")
         job_id = status_msg.message_id
         ACTIVE_INDEX_JOBS[job_id] = {"paused": False, "cancelled": False}
 
@@ -494,82 +624,23 @@ def register_indexer_handler(bot: AsyncTeleBot) -> None:
             reply_markup=build_batch_control_keyboard(job_id, is_paused=False),
         )
 
-        # Use log_group_id as temporary probe chat when inspecting messages outside INDEX_CHANNEL_ID
-        probe_chat_id = int(log_group_id) if log_group_id else message.chat.id
+        try:
+            stats = await process_index_batch(
+                bot,
+                source_chat_id=source_chat_id,
+                last_msg_id=last_msg_id,
+                skip_msg_id=skip_msg_id,
+                filter_topic_id=filter_topic_id,
+                chat_obj=chat_obj,
+                resolved_chat_id=resolved_chat_id,
+                log_group_id=log_group_id,
+                status_msg=status_msg,
+                job_id=job_id,
+            )
+        finally:
+            ACTIVE_INDEX_JOBS.pop(job_id, None)
 
-        for msg_id in range(1, last_msg_id + 1):
-            job_state = ACTIVE_INDEX_JOBS.get(job_id)
-            if not job_state or job_state["cancelled"]:
-                break
-
-            while job_state["paused"] and not job_state["cancelled"]:
-                await asyncio.sleep(1.5)
-
-            if job_state["cancelled"]:
-                break
-
-            stats["fetched"] += 1
-            stats["remaining"] = last_msg_id - stats["fetched"]
-
-            if msg_id <= skip_msg_id:
-                stats["skipped"] += 1
-                continue
-
-            # Probe message to inspect its media content
-            try:
-                probed_msg = await bot.forward_message(
-                    chat_id=probe_chat_id,
-                    from_chat_id=resolved_chat_id,
-                    message_id=msg_id,
-                    disable_notification=True,
-                )
-            except Exception as e:
-                err_u = str(e).upper()
-                if "MESSAGE TO FORWARD NOT FOUND" in err_u or "MESSAGE_ID_INVALID" in err_u:
-                    stats["deleted"] += 1
-                else:
-                    stats["filtered"] += 1
-                continue
-
-            # Clean up the temporary probe message immediately
-            try:
-                await bot.delete_message(chat_id=probe_chat_id, message_id=probed_msg.message_id)
-            except Exception:
-                pass
-
-            # Check optional Forum Topic filter
-            if filter_topic_id is not None and getattr(probed_msg, "message_thread_id", None) != filter_topic_id:
-                stats["skipped"] += 1
-                continue
-
-            # Restore original source chat metadata on the probed message for Dual-Check indexing
-            probed_msg.chat = chat_obj
-            probed_msg.message_id = msg_id
-
-            outcome = await process_single_file_dual_check(bot, probed_msg, send_log=True)
-            if outcome == "forwarded":
-                stats["forwarded"] += 1
-            elif outcome == "duplicate":
-                stats["duplicate"] += 1
-            else:
-                stats["filtered"] += 1
-
-            # Update progress box every 15 messages
-            if stats["fetched"] % 15 == 0 or stats["fetched"] == last_msg_id:
-                try:
-                    await bot.edit_message_text(
-                        text=render_progress_box(stats, status_label="forwarding", footer_label="ᴘʀᴏɢʀᴇssɪɴɢ"),
-                        chat_id=status_msg.chat.id,
-                        message_id=job_id,
-                        parse_mode="HTML",
-                        reply_markup=build_batch_control_keyboard(job_id, is_paused=job_state["paused"]),
-                    )
-                except Exception:
-                    pass
-
-            await asyncio.sleep(1.2)
-
-        final_state = ACTIVE_INDEX_JOBS.pop(job_id, {"cancelled": False})
+        final_state = ACTIVE_INDEX_JOBS.get(job_id, {"cancelled": False})
         if final_state.get("cancelled"):
             final_box = render_progress_box(stats, status_label="cancelled", footer_label="ᴄᴀɴᴄᴇʟʟᴇᴅ ❌")
             try:
@@ -637,3 +708,7 @@ def register_indexer_handler(bot: AsyncTeleBot) -> None:
         elif action == "cancel":
             job["cancelled"] = True
             await bot.answer_callback_query(call.id, "❌ Cancelling indexing job...", show_alert=True)
+
+
+if __name__ == "__main__":
+    pass
