@@ -10,11 +10,14 @@ from functions.admin_config.redeploy_manager import register_redeploy_handler
 from functions.indexer.indexer_handler import register_indexer_handler
 from functions.search_function.search_handler import register_search_handler
 from functions.script_engine.editscript_handler import register_editscript_handler
-from functions.script_engine.script_sender import send_script_message
+from functions.ban_handler import register_ban_handler
 from server.web_server import start_web_server
 from database.config_database.config_db import get_all_config_vars
 from database.files_database.files_db import init_files_db_indexes
 from database.scripts_database.scripts_db import init_scripts_db_indexes
+from database.user_roles_db import init_user_roles_indexes
+from database.access_limits_db import init_access_limit_indexes
+from database.ban_db import init_ban_indexes
 from functions.error_logger.error_log_sender import verify_startup_configuration
 import config.settings as settings
 
@@ -30,6 +33,9 @@ async def main() -> None:
 
     await init_files_db_indexes()
     await init_scripts_db_indexes()
+    await init_user_roles_indexes()
+    await init_access_limit_indexes()
+    await init_ban_indexes()
 
     if not settings.BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing! Please set it in .env or environment variables.")
@@ -43,6 +49,7 @@ async def main() -> None:
     register_indexer_handler(bot)
     register_search_handler(bot)
     register_editscript_handler(bot)
+    register_ban_handler(bot)
     register_help_handler(bot)
 
     await start_web_server()

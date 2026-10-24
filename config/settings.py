@@ -8,7 +8,7 @@ def parse_id_list(val: str) -> list[int]:
     """Parses a comma or space separated string of IDs into a list of integers."""
     if not val:
         return []
-    ids = []
+    ids: list[int] = []
     for item in val.replace(",", " ").split():
         item = item.strip()
         if item.lstrip("-").isdigit():
@@ -40,6 +40,8 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "MayankBotDB")
 # Roles & Permissions
 OWNER_IDS: list[int] = parse_id_list(os.getenv("OWNER_IDS", ""))
 ADMIN_IDS: list[int] = parse_id_list(os.getenv("ADMIN_IDS", ""))
+VOLUNTEER_IDS: list[int] = parse_id_list(os.getenv("VOLUNTEER_IDS", ""))
+BANNED_USER_IDS: list[int] = parse_id_list(os.getenv("BANNED_USER_IDS", ""))
 
 # Log Group & Forum Topic IDs
 LOG_GROUP_ID = parse_optional_int(os.getenv("LOG_GROUP_ID"), None)
@@ -78,6 +80,7 @@ def apply_config_overrides(overrides: dict) -> None:
     global INDEX_LOG_TOPIC_ID, ERROR_LOG_TOPIC_ID
     global INDEX_CHANNEL_ID, FILE_SHARING_CHANNEL_ID, FILE_AUTO_DELETE_SECONDS
     global PORT, RENDER_DEPLOY_HOOK_URL
+    global OWNER_IDS, ADMIN_IDS, VOLUNTEER_IDS, BANNED_USER_IDS
 
     if not overrides:
         return
@@ -91,31 +94,56 @@ def apply_config_overrides(overrides: dict) -> None:
     MONGO_URL = os.getenv("MONGO_URL", MONGO_URL)
     DATABASE_NAME = os.getenv("DATABASE_NAME", DATABASE_NAME)
 
-    # Update role lists in-place so imported references see changes immediately
     OWNER_IDS.clear()
     OWNER_IDS.extend(parse_id_list(os.getenv("OWNER_IDS", "")))
 
     ADMIN_IDS.clear()
     ADMIN_IDS.extend(parse_id_list(os.getenv("ADMIN_IDS", "")))
 
+    VOLUNTEER_IDS.clear()
+    VOLUNTEER_IDS.extend(parse_id_list(os.getenv("VOLUNTEER_IDS", "")))
+
+    BANNED_USER_IDS.clear()
+    BANNED_USER_IDS.extend(parse_id_list(os.getenv("BANNED_USER_IDS", "")))
+
     LOG_GROUP_ID = parse_optional_int(os.getenv("LOG_GROUP_ID"), None)
     USER_LOG_TOPIC_ID = parse_optional_int(os.getenv("USER_LOG_TOPIC_ID"), None)
-    CHANNEL_LOG_TOPIC_ID = parse_optional_int(
-        os.getenv("CHANNEL_LOG_TOPIC_ID"), None
-    )
+    CHANNEL_LOG_TOPIC_ID = parse_optional_int(os.getenv("CHANNEL_LOG_TOPIC_ID"), None)
     GROUP_LOG_TOPIC_ID = parse_optional_int(os.getenv("GROUP_LOG_TOPIC_ID"), None)
     INDEX_LOG_TOPIC_ID = parse_optional_int(os.getenv("INDEX_LOG_TOPIC_ID"), None)
     ERROR_LOG_TOPIC_ID = parse_optional_int(os.getenv("ERROR_LOG_TOPIC_ID"), None)
 
     INDEX_CHANNEL_ID = parse_optional_int(os.getenv("INDEX_CHANNEL_ID"), None)
-    FILE_SHARING_CHANNEL_ID = parse_optional_int(
-        os.getenv("FILE_SHARING_CHANNEL_ID"), None
-    )
-    FILE_AUTO_DELETE_SECONDS = parse_optional_int(
-        os.getenv("FILE_AUTO_DELETE_SECONDS"), 300
-    )
+    FILE_SHARING_CHANNEL_ID = parse_optional_int(os.getenv("FILE_SHARING_CHANNEL_ID"), None)
+    FILE_AUTO_DELETE_SECONDS = parse_optional_int(os.getenv("FILE_AUTO_DELETE_SECONDS"), 300)
 
     PORT = parse_optional_int(os.getenv("PORT"), 8080)
-    RENDER_DEPLOY_HOOK_URL = os.getenv(
-        "RENDER_DEPLOY_HOOK_URL", RENDER_DEPLOY_HOOK_URL
-    )
+    RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL", RENDER_DEPLOY_HOOK_URL)
+
+
+__all__ = [
+    "API_ID",
+    "API_HASH",
+    "BOT_TOKEN",
+    "MONGO_URL",
+    "DATABASE_NAME",
+    "OWNER_IDS",
+    "ADMIN_IDS",
+    "VOLUNTEER_IDS",
+    "BANNED_USER_IDS",
+    "LOG_GROUP_ID",
+    "USER_LOG_TOPIC_ID",
+    "CHANNEL_LOG_TOPIC_ID",
+    "GROUP_LOG_TOPIC_ID",
+    "INDEX_LOG_TOPIC_ID",
+    "ERROR_LOG_TOPIC_ID",
+    "INDEX_CHANNEL_ID",
+    "FILE_SHARING_CHANNEL_ID",
+    "FILE_AUTO_DELETE_SECONDS",
+    "ALLOWED_EXTENSIONS",
+    "EBOOK_EXTENSIONS",
+    "AUDIOBOOK_EXTENSIONS",
+    "PORT",
+    "RENDER_DEPLOY_HOOK_URL",
+    "apply_config_overrides",
+]
