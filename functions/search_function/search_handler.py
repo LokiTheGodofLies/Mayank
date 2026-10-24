@@ -1,41 +1,57 @@
+import html
+
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import Message
 
-from database.users_database.users_db import save_user
-from functions.script_engine.script_sender import send_script_message
-from functions.start_function.user_log_sender import send_user_start_log
+from database.files_database.files_db import format_file_size
+from database.scripts_database.scripts_db import search_indexed_files
 
 
-def register_start_handler(bot: AsyncTeleBot) -> None:
-    """Registers the /start command handler on the bot."""
+def register_search_handler(bot: AsyncTeleBot) -> None:
+    """Registers the /search command handler on the bot."""
 
-    @bot.message_handler(commands=["start"])
-    async def handle_start(message: Message) -> None:
-        user = message.from_user
-        if user is None:
+    @bot.message_handler(commands=["search"])
+    async def handle_search(message: Message) -> None:
+        if not message.from_user:
             return
 
-        user_record = await save_user(
-            user_id=user.id,
-            full_name=user.full_name or "Unknown",
-            username=user.username,
-        )
-        role = user_record.get("role", "normal_user")
+        parts = (message.text or "").split(None, 1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if not query:
+            await bot.reply_to(
+                message,
+                "<b>Usage:</b> <code>/search &lt;query&gt;</code>",
+                parse_mode="HTML",
+            )
+            return
 
-        await send_script_message(
-            bot,
-            chat_id=message.chat.id,
-            script_key="start",
-            context={
-                "user_name": user.full_name or "User",
-                "username": user.username or "",
-                "user_id": user.id,
-                "user_link": f"tg://user?id={user.id}",
-                "user_role": role,
-                "bot_name": (await bot.get_me()).first_name or "Bot",
-                "bot_username": (await bot.get_me()).username or "",
-                "bot_link": f"https://t.me/{(await bot.get_me()).username}",
-            },
-        )
+        results, total_count, _ = await search_indexed_files(query=query, page=1, per_page=5)
+        if not results:
+            await bot.reply_to(
+                message,
+                f"❌ No files found for <b>{html.escape(query)}</b>.",
+                parse_mode="HTML",
+            )
+            return
 
-        await send_user_start_log(bot=bot, user=user, role=role)
+        lines = []
+        for index, item in enumerate(results[:5], start=1):
+            file_name = str(item.get("file_name") or "Unknown file")
+            file_type = str(item.get("file_type") or "ebook").upper()
+            file_size = format_file_size(item.get("file_size"))
+            lines.append(
+                f"{index}. <b>{html.escape(file_name)}</b>\n"
+                f"   {file_type} • {file_size}"
+            )
+
+        response = (
+            f"<b>🔎 Search results for:</b> <code>{html.escape(query)}</code>\n\n"
+            + "\n\n".join(lines)
+        )
+        if total_count > len(results):
+            response += f"\n\n<i>Showing {len(results)} of {total_count} results.</i>"
+
+        await bot.reply_to(message, response, parse_mode="HTML")
+
+
+__all__ = ["register_search_handler"]
