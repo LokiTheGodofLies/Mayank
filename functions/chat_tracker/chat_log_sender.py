@@ -20,18 +20,26 @@ async def send_chat_status_log(
     action: str,
     invite_link: str | None = None,
 ) -> None:
-    """Sends a log when the bot is added/removed from a group or channel."""
+    """Logs when the bot is added, removed, or banned from a group/channel."""
     if not getattr(settings, "LOG_GROUP_ID", None):
         return
 
     try:
         bot_info = await bot.get_me()
         bot_name = html.escape(bot_info.first_name or "Bot")
-        bot_link = f'<a href="https://t.me/{bot_info.username}">{bot_name}</a>' if bot_info.username else bot_name
+        bot_link = (
+            f'<a href="https://t.me/{bot_info.username}">{bot_name}</a>'
+            if bot_info.username
+            else bot_name
+        )
 
         is_channel = chat.type == "channel"
         label = "Channel" if is_channel else "Group"
-        topic_id = getattr(settings, "CHANNEL_LOG_TOPIC_ID", None) if is_channel else getattr(settings, "GROUP_LOG_TOPIC_ID", None)
+        topic_id = (
+            getattr(settings, "CHANNEL_LOG_TOPIC_ID", None)
+            if is_channel
+            else getattr(settings, "GROUP_LOG_TOPIC_ID", None)
+        )
 
         chat_title = html.escape(chat.title or f"Unnamed {label}")
         chat_username = f"@{chat.username}" if chat.username else "Private"
@@ -59,6 +67,9 @@ async def send_chat_status_log(
         if action == "added":
             header = f"<b>#Bot_Added_To_{label}</b>"
             summary_line = f"{bot_link} was <b>added</b> to {label}: <b>{chat_title}</b>"
+        elif action == "banned":
+            header = f"<b>#Bot_Banned_From_{label}</b>"
+            summary_line = f"{bot_link} was <b>banned / blocked</b> from {label}: <b>{chat_title}</b>"
         else:
             header = f"<b>#Bot_Removed_From_{label}</b>"
             summary_line = f"{bot_link} was <b>removed</b> from {label}: <b>{chat_title}</b>"
@@ -100,7 +111,7 @@ async def send_user_action_log(
     chat: Chat | None = None,
     reason: str | None = None,
 ) -> None:
-    """Sends a log for user start, ban, kick, unban, etc."""
+    """Logs user-side bot activity: /start or bot ban cases only."""
     if not getattr(settings, "LOG_GROUP_ID", None):
         return
 
@@ -133,10 +144,7 @@ async def send_user_action_log(
 
     action_tag = {
         "started_bot": "#USER_STARTED_BOT",
-        "banned": "#USER_BANNED",
-        "kicked": "#USER_KICKED",
-        "left": "#USER_LEFT_CHAT",
-        "unbanned": "#USER_UNBANNED",
+        "bot_banned": "#USER_BOT_BANNED",
     }.get(action, "#USER_ACTION")
 
     text = (
