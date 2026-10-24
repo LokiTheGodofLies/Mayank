@@ -1,199 +1,254 @@
 import math
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 
+from config.strings import DEFAULT_SCRIPTS
 from database.connection import db
 
-files_collection = db["files_database"] if db is not None else None
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+scripts_collection = db["scripts_database"] if db is not None else None
 
 
 def get_ist_time() -> str:
-    """Returns current timestamp formatted in Indian Standard Time (IST, UTC+5:30)."""
+    """Returns the current timestamp formatted in Indian Standard Time (IST)."""
     ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist_tz).strftime("%Y-%m-%d %I:%M:%S %p IST")
+    return datetime.now(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
-async def init_files_db_indexes() -> None:
-    """Creates indexes on file_unique_id, file_type, and file_name for fast lookups."""
-    if files_collection is None:
+async def init_scripts_db_indexes() -> None:
+    """Creates the required indexes for script customization storage."""
+    if db is None:
         return
+
+    collection = db["scripts_database"]
     try:
-        await files_collection.create_index("file_unique_id", unique=True)
-        await files_collection.create_index("file_type")
-        await files_collection.create_index("file_name")
-    except Exception as e:
-        print(f"[FILES_DB INDEX ERROR] {e}")
-
-
-async def is_file_already_indexed(file_unique_id: str) -> dict | None:
-    """
-    Checks if a file with the given file_unique_id already exists in the database.
-    Returns the existing document if found, otherwise None.
-    """
-    if not file_unique_id or files_collection is None:
-        return None
-    return await files_collection.find_one({"file_unique_id": file_unique_id})
-
-
-async def update_indexed_file_channel_msg(
-    file_unique_id: str,
-    db_channel_id: int,
-    db_message_id: int,
-    new_file_id: str | None = None,
-) -> bool:
-    """
-    Updates the Telegram Index Channel message ID (db_message_id) in MongoDB
-    when a previously indexed file was missing/deleted from INDEX_CHANNEL_ID
-    and had to be re-forwarded during Dual-Check /index.
-    """
-    if not file_unique_id or files_collection is None:
-        return False
-
-    update_fields: dict = {
-        "db_channel_id": int(db_channel_id),
-        "db_message_id": int(db_message_id),
-        "updated_at": get_ist_time(),
-    }
-    if new_file_id:
-        update_fields["file_id"] = new_file_id
-
-    try:
-        await files_collection.update_one(
-            {"file_unique_id": file_unique_id},
-            {"$set": update_fields},
-        )
-        return True
-    except Exception as e:
-        print(f"[FILES_DB UPDATE MSG ERROR] {e}")
-        return False
-
-
-async def save_indexed_file(file_data: dict) -> tuple[bool, dict]:
-    """
-    Saves an indexed eBook or Audiobook record in MongoDB.
-    Returns (is_new_insert, document).
-    """
-    if files_collection is None:
-        return False, {"file_unique_id": file_data.get("file_unique_id"), "file_name": file_data.get("file_name", "Unknown")}
-
-    now_ist = get_ist_time()
-    file_unique_id = file_data.get("file_unique_id")
-
-    existing = await is_file_already_indexed(file_unique_id)
-    if existing:
-        return False, existing
-
-    record = {
-        "file_unique_id": file_unique_id,
-        "file_id": file_data.get("file_id", ""),
-        "file_name": file_data.get("file_name", "Unknown"),
-        "file_size": int(file_data.get("file_size") or 0),
-        "caption": file_data.get("caption") or "",
-        "duration": file_data.get("duration"),
-        "file_extension": str(file_data.get("file_extension") or "").lstrip(".").lower(),
-        "file_type": str(file_data.get("file_type") or "ebook").lower(),
-        "db_channel_id": file_data.get("db_channel_id"),
-        "db_message_id": file_data.get("db_message_id"),
-        "source_chat_id": file_data.get("source_chat_id"),
-        "source_chat_title": file_data.get("source_chat_title") or "Unknown Chat",
-        "source_chat_username": file_data.get("source_chat_username"),
-        "source_message_id": file_data.get("source_message_id"),
-        "topic_id": file_data.get("topic_id"),
-        "is_direct_upload": bool(file_data.get("is_direct_upload", False)),
-        "indexed_at": now_ist,
-    }
-
-    result = await files_collection.insert_one(record)
-    record["_id"] = result.inserted_id
-    return True, record
-
-
-async def get_file_by_id(record_id: str) -> dict | None:
-    """
-    Fetches a single indexed file by its MongoDB _id string or file_unique_id.
-    Used when a user clicks a file button in /search results.
-    """
-    if not record_id or files_collection is None:
-        return None
-    try:
-        if ObjectId.is_valid(record_id):
-            doc = await files_collection.find_one({"_id": ObjectId(record_id)})
-            if doc:
-                return doc
+        await collection.create_index("script_key", unique=True)
     except Exception:
         pass
-    return await files_collection.find_one({"file_unique_id": record_id})
 
 
-def _build_word_to_word_filter(query: str, file_type: str | None = None, strict_boundaries: bool = True) -> dict:
-    """
-    Builds a MongoDB filter matching every word from the search query
-    in either file_name or caption.
-    """
-    words = [w.strip() for w in re.split(r"[\s_\-\.]+", query.strip()) if w.strip()]
-    and_conditions = []
+async def _get_scripts_collection():
+    if db is None:
+        return None
+    return db["scripts_database"]
 
-    for word in words:
-        escaped = re.escape(word)
-        if strict_boundaries:
-            pattern = rf"(?<![a-zA-Z0-9]){escaped}(?![a-zA-Z0-9])"
-        else:
-            pattern = escaped
 
-        regex_obj = {"$regex": pattern, "$options": "i"}
-        and_conditions.append(
+async def get_script_config(script_key: str) -> dict:
+    """Fetches the stored config for a script, falling back to the default template."""
+    if not script_key:
+        return {}
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return {
+            "script_key": script_key,
+            "text": DEFAULT_SCRIPTS.get(script_key, ""),
+            "media_pool": [],
+            "buttons": [],
+        }
+
+    doc = await collection.find_one({"script_key": script_key})
+    if not doc:
+        return {
+            "script_key": script_key,
+            "text": DEFAULT_SCRIPTS.get(script_key, ""),
+            "media_pool": [],
+            "buttons": [],
+        }
+
+    config = dict(doc)
+    config.setdefault("script_key", script_key)
+    config.setdefault("text", DEFAULT_SCRIPTS.get(script_key, ""))
+    config.setdefault("media_pool", [])
+    config.setdefault("buttons", [])
+    return config
+
+
+async def update_script_text(script_key: str, new_text: str, parse_mode: str = "HTML") -> bool:
+    """Stores a custom script text value for a given key."""
+    if not script_key:
+        return False
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False
+
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "text": str(new_text),
+                "updated_at": get_ist_time(),
+                "parse_mode": parse_mode,
+            }
+        },
+        upsert=True,
+    )
+    return True
+
+
+async def add_script_media(
+    script_key: str,
+    file_id: str,
+    file_unique_id: str,
+    media_type: str,
+    duration: int | None = None,
+) -> tuple[bool, str]:
+    """Adds a media item to the script media pool."""
+    if not script_key or not file_id:
+        return False, "Invalid script media payload."
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False, "Script database is unavailable."
+
+    script = await get_script_config(script_key)
+    media_pool = list(script.get("media_pool") or [])
+    if not any(item.get("file_unique_id") == file_unique_id for item in media_pool):
+        media_pool.append(
             {
-                "$or": [
-                    {"file_name": regex_obj},
-                    {"caption": regex_obj},
-                ]
+                "file_id": file_id,
+                "file_unique_id": file_unique_id,
+                "media_type": media_type,
+                "duration": duration,
             }
         )
 
-    mongo_filter: dict = {}
-    if and_conditions:
-        mongo_filter["$and"] = and_conditions
-
-    if file_type in ("ebook", "audiobook"):
-        mongo_filter["file_type"] = file_type
-
-    return mongo_filter
-
-
-async def search_indexed_files(
-    query: str,
-    file_type: str | None = None,
-    page: int = 1,
-    per_page: int = 10,
-) -> tuple[list[dict], int, int]:
-    """
-    Performs word-to-word search across file_name and caption.
-    Returns (results_for_page, total_matching_files, total_pages).
-    """
-    if not query or not query.strip() or files_collection is None:
-        return [], 0, 1
-
-    mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=True)
-    total_count = await files_collection.count_documents(mongo_filter)
-
-    if total_count == 0:
-        mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=False)
-        total_count = await files_collection.count_documents(mongo_filter)
-
-    if total_count == 0:
-        return [], 0, 1
-
-    total_pages = max(1, math.ceil(total_count / per_page))
-    page = max(1, min(page, total_pages))
-    skip_count = (page - 1) * per_page
-
-    cursor = (
-        files_collection.find(mongo_filter)
-        .sort("_id", -1)
-        .skip(skip_count)
-        .limit(per_page)
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "media_pool": media_pool,
+                "updated_at": get_ist_time(),
+            }
+        },
+        upsert=True,
     )
-    results = await cursor.to_list(length=per_page)
-    return results, total_count, total_pages
+    return True, f"✅ Added media to <code>{script_key}</code>."
+
+
+async def clear_script_media(script_key: str) -> bool:
+    """Clears the media pool for the script."""
+    if not script_key:
+        return False
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False
+
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "media_pool": [],
+                "updated_at": get_ist_time(),
+            }
+        },
+        upsert=True,
+    )
+    return True
+
+
+async def add_script_button_row(script_key: str, button_row: list[dict]) -> bool:
+    """Adds one row of inline buttons to the script configuration."""
+    if not script_key:
+        return False
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False
+
+    script = await get_script_config(script_key)
+    buttons = list(script.get("buttons") or [])
+    normalized_row = []
+    for button in button_row or []:
+        normalized_row.append(
+            {
+                "text": str(button.get("text") or "Button"),
+                "type": str(button.get("type") or "callback"),
+                "value": str(button.get("value") or ""),
+            }
+        )
+
+    buttons.append(normalized_row)
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "buttons": buttons,
+                "updated_at": get_ist_time(),
+            }
+        },
+        upsert=True,
+    )
+    return True
+
+
+async def clear_script_buttons(script_key: str) -> bool:
+    """Clears all button rows for the script."""
+    if not script_key:
+        return False
+
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False
+
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "buttons": [],
+                "updated_at": get_ist_time(),
+            }
+        },
+        upsert=True,
+    )
+    return True
+
+
+async def reset_script_to_default(script_key: str) -> bool:
+    """Resets a script config to the repository defaults."""
+    if not script_key:
+        return False
+
+    default_text = DEFAULT_SCRIPTS.get(script_key, "")
+    collection = await _get_scripts_collection()
+    if collection is None:
+        return False
+
+    await collection.update_one(
+        {"script_key": script_key},
+        {
+            "$set": {
+                "script_key": script_key,
+                "text": default_text,
+                "media_pool": [],
+                "buttons": [],
+                "updated_at": get_ist_time(),
+            }
+        },
+        upsert=True,
+    )
+    return True
+
+
+__all__ = [
+    "get_ist_time",
+    "init_scripts_db_indexes",
+    "get_script_config",
+    "update_script_text",
+    "add_script_media",
+    "clear_script_media",
+    "add_script_button_row",
+    "clear_script_buttons",
+    "reset_script_to_default",
+]
