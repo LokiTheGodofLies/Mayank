@@ -1,192 +1,123 @@
-import math
-import re
-from datetime import datetime, timezone, timedelta
-from bson import ObjectId
-from database.connection import db
+import html
+import os
+from telebot.async_telebot import AsyncTeleBot
+from telebot.types import Message
+import config.settings as settings
+from database.config_database.config_db import (
+    set_config_var,
+    get_all_config_vars,
+    delete_config_var,
+)
 
-files_collection = db["files_database"]
-
-
-def get_ist_time() -> str:
-    """Returns current timestamp formatted in Indian Standard Time (IST, UTC+5:30)."""
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist_tz).strftime("%Y-%m-%d %I:%M:%S %p IST")
-
-
-async def init_files_db_indexes() -> None:
-    """Creates indexes on file_unique_id, file_type, and file_name for fast lookups."""
-    try:
-        await files_collection.create_index("file_unique_id", unique=True)
-        await files_collection.create_index("file_type")
-        await files_collection.create_index("file_name")
-    except Exception as e:
-        print(f"[FILES_DB INDEX ERROR] {e}")
-
-
-async def is_file_already_indexed(file_unique_id: str) -> dict | None:
-    """
-    Checks if a file with the given file_unique_id already exists in the database.
-    Returns the existing document if found, otherwise None.
-    """
-    if not file_unique_id:
-        return None
-    return await files_collection.find_one({"file_unique_id": file_unique_id})
+# Keys that are displayed when running /getvars
+TRACKED_KEYS = [
+    "API_ID",
+    "OWNER_IDS",
+    "ADMIN_IDS",
+    "LOG_GROUP_ID",
+    "USER_LOG_TOPIC_ID",
+    "GROUP_LOG_TOPIC_ID",
+    "CHANNEL_LOG_TOPIC_ID",
+    "DATABASE_NAME",
+    "RENDER_DEPLOY_HOOK_URL",
+]
 
 
-async def update_indexed_file_channel_msg(
-    file_unique_id: str,
-    db_channel_id: int,
-    db_message_id: int,
-    new_file_id: str | None = None,
-) -> bool:
-    """
-    Updates the Telegram Index Channel message ID (db_message_id) in MongoDB
-    when a previously indexed file was missing/deleted from INDEX_CHANNEL_ID
-    and had to be re-forwarded during Dual-Check /index.
-    """
-    if not file_unique_id:
-        return False
-
-    update_fields: dict = {
-        "db_channel_id": int(db_channel_id),
-        "db_message_id": int(db_message_id),
-        "updated_at": get_ist_time(),
-    }
-    if new_file_id:
-        update_fields["file_id"] = new_file_id
-
-    try:
-        await files_collection.update_one(
-            {"file_unique_id": file_unique_id},
-            {"$set": update_fields},
+async def process_setvar(bot: AsyncTeleBot, message: Message) -> None:
+    """Handles /setvar KEY VALUE to update an environment variable and save it in MongoDB."""
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await bot.reply_to(
+            message,
+            "<b>Usage:</b> <code>/setvar KEY VALUE</code>\n"
+            "<b>Example:</b> <code>/setvar USER_LOG_TOPIC_ID 12</code>",
+            parse_mode="HTML",
         )
-        return True
-    except Exception as e:
-        print(f"[FILES_DB UPDATE MSG ERROR] {e}")
-        return False
+        return
 
+    key = parts[1].strip().upper()
+    value = parts[2].strip()
 
-async def save_indexed_file(file_data: dict) -> tuple[bool, dict]:
-    """
-    Saves an indexed eBook or Audiobook record in MongoDB.
-    Returns (is_new_insert, document).
-    """
-    now_ist = get_ist_time()
-    file_unique_id = file_data.get("file_unique_id")
+    await set_config_var(key, value)
+    settings.apply_config_overrides({key: value})
 
-    existing = await is_file_already_indexed(file_unique_id)
-    if existing:
-        return False, existing
-
-    record = {
-        "file_unique_id": file_unique_id,
-        "file_id": file_data.get("file_id", ""),
-        "file_name": file_data.get("file_name", "Unknown"),
-        "file_size": int(file_data.get("file_size") or 0),
-        "caption": file_data.get("caption") or "",
-        "duration": file_data.get("duration"),
-        "file_extension": str(file_data.get("file_extension") or "").lstrip(".").lower(),
-        "file_type": str(file_data.get("file_type") or "ebook").lower(),
-        "db_channel_id": file_data.get("db_channel_id"),
-        "db_message_id": file_data.get("db_message_id"),
-        "source_chat_id": file_data.get("source_chat_id"),
-        "source_chat_title": file_data.get("source_chat_title") or "Unknown Chat",
-        "source_chat_username": file_data.get("source_chat_username"),
-        "source_message_id": file_data.get("source_message_id"),
-        "topic_id": file_data.get("topic_id"),
-        "is_direct_upload": bool(file_data.get("is_direct_upload", False)),
-        "indexed_at": now_ist,
-    }
-
-    result = await files_collection.insert_one(record)
-    record["_id"] = result.inserted_id
-    return True, record
-
-
-async def get_file_by_id(record_id: str) -> dict | None:
-    """
-    Fetches a single indexed file by its MongoDB _id string or file_unique_id.
-    Used when a user clicks a file button in /search results.
-    """
-    if not record_id:
-        return None
-    try:
-        if ObjectId.is_valid(record_id):
-            doc = await files_collection.find_one({"_id": ObjectId(record_id)})
-            if doc:
-                return doc
-    except Exception:
-        pass
-    return await files_collection.find_one({"file_unique_id": record_id})
-
-
-def _build_word_to_word_filter(query: str, file_type: str | None = None, strict_boundaries: bool = True) -> dict:
-    """
-    Builds a MongoDB filter matching every word from the search query
-    in either file_name or caption.
-    """
-    words = [w.strip() for w in re.split(r"[\s_\-\.]+", query.strip()) if w.strip()]
-    and_conditions = []
-
-    for word in words:
-        escaped = re.escape(word)
-        if strict_boundaries:
-            pattern = rf"(?<![a-zA-Z0-9]){escaped}(?![a-zA-Z0-9])"
-        else:
-            pattern = escaped
-
-        regex_obj = {"$regex": pattern, "$options": "i"}
-        and_conditions.append(
-            {
-                "$or": [
-                    {"file_name": regex_obj},
-                    {"caption": regex_obj},
-                ]
-            }
-        )
-
-    mongo_filter: dict = {}
-    if and_conditions:
-        mongo_filter["$and"] = and_conditions
-
-    if file_type in ("ebook", "audiobook"):
-        mongo_filter["file_type"] = file_type
-
-    return mongo_filter
-
-
-async def search_indexed_files(
-    query: str,
-    file_type: str | None = None,
-    page: int = 1,
-    per_page: int = 10,
-) -> tuple[list[dict], int, int]:
-    """
-    Performs word-to-word search across file_name and caption.
-    Returns (results_for_page, total_matching_files, total_pages).
-    """
-    if not query or not query.strip():
-        return [], 0, 1
-
-    mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=True)
-    total_count = await files_collection.count_documents(mongo_filter)
-
-    if total_count == 0:
-        mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=False)
-        total_count = await files_collection.count_documents(mongo_filter)
-
-    if total_count == 0:
-        return [], 0, 1
-
-    total_pages = max(1, math.ceil(total_count / per_page))
-    page = max(1, min(page, total_pages))
-    skip_count = (page - 1) * per_page
-
-    cursor = (
-        files_collection.find(mongo_filter)
-        .sort("_id", -1)
-        .skip(skip_count)
-        .limit(per_page)
+    await bot.reply_to(
+        message,
+        f"✅ Variable <code>{html.escape(key)}</code> updated to:\n"
+        f"<code>{html.escape(value)}</code>\n\n"
+        f"<i>Saved in MongoDB. Use /restart to apply across all modules immediately.</i>",
+        parse_mode="HTML",
     )
-    results = await cursor.to_list(length=per_page)
-    return results, total_count, total_pages
+
+
+async def process_getvars(bot: AsyncTeleBot, message: Message) -> None:
+    """Handles /getvars to list active configuration variables and MongoDB overrides."""
+    db_overrides = await get_all_config_vars()
+    all_keys = list(dict.fromkeys(TRACKED_KEYS + list(db_overrides.keys())))
+
+    lines = ["<b>⚙️ Current Bot Variables:</b>\n"]
+    for key in all_keys:
+        val = os.getenv(key, "")
+        source = "MongoDB Override" if key in db_overrides else "Render Env"
+        if key in ("BOT_TOKEN", "API_HASH", "MONGO_URL") and val:
+            display_val = val[:6] + "..." + val[-4:]
+        else:
+            display_val = val if val else "Not Set"
+        lines.append(
+            f"• <b>{html.escape(key)}:</b> <code>{html.escape(display_val)}</code> <i>({source})</i>"
+        )
+
+    await bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
+
+async def process_delvar(bot: AsyncTeleBot, message: Message) -> None:
+    """Handles /delvar KEY to remove a MongoDB override."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await bot.reply_to(
+            message,
+            "<b>Usage:</b> <code>/delvar KEY</code>\n"
+            "<b>Example:</b> <code>/delvar USER_LOG_TOPIC_ID</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    key = parts[1].strip().upper()
+    deleted = await delete_config_var(key)
+    if deleted:
+        await bot.reply_to(
+            message,
+            f"🗑 Removed MongoDB override for <code>{html.escape(key)}</code>.\n"
+            f"<i>Send /restart to revert to the default Render variable.</i>",
+            parse_mode="HTML",
+        )
+    else:
+        await bot.reply_to(
+            message,
+            f"ℹ️ No MongoDB override found for <code>{html.escape(key)}</code>.",
+            parse_mode="HTML",
+        )
+
+
+def register_var_manager_handler(bot: AsyncTeleBot) -> None:
+    """Registers /setvar, /getvars, and /delvar for admin use."""
+
+    @bot.message_handler(commands=["setvar"])
+    async def handle_setvar(message: Message):
+        await process_setvar(bot, message)
+
+    @bot.message_handler(commands=["getvars"])
+    async def handle_getvars(message: Message):
+        await process_getvars(bot, message)
+
+    @bot.message_handler(commands=["delvar"])
+    async def handle_delvar(message: Message):
+        await process_delvar(bot, message)
+
+
+__all__ = [
+    "register_var_manager_handler",
+    "process_setvar",
+    "process_getvars",
+    "process_delvar",
+]
