@@ -1,439 +1,287 @@
+import asyncio
+import hashlib
 import html
-import re
-from typing import Any
 
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config.settings as settings
-from config.strings import SCRIPT_KEYS_ORDER, SCRIPT_TITLES
-from database.scripts_database.scripts_db import (
-    add_script_button_row,
-    add_script_media,
-    clear_script_buttons,
-    clear_script_media,
-    get_script_config,
-    reset_script_to_default,
-    set_script_buttons,
-    update_script_text,
-)
+from database.files_database.files_db import get_file_by_id, search_indexed_files
 from functions.script_engine.script_sender import send_script_message
 
-PAGE_SIZE = 10
-ACTIVE_EDIT_SESSIONS: dict[int, dict[str, str]] = {}
+SEARCH_QUERY_CACHE: dict[str, str] = {}
+
+FILTER_CODE_TO_TYPE = {
+    "a": None,
+    "e": "ebook",
+    "u": "audiobook",
+}
 
 
-def is_admin_or_owner(user_id: int) -> bool:
-    owners = getattr(settings, "OWNER_IDS", []) or []
-    admins = getattr(settings, "ADMIN_IDS", []) or []
-    allowed = {int(uid) for uid in (owners + admins)}
-    return int(user_id) in allowed
+def register_query_key(query_text: str) -> str:
+    clean_query = query_text.strip()
+    key = hashlib.md5(clean_query.lower().encode("utf-8")).hexdigest()[:8]
+    SEARCH_QUERY_CACHE[key] = clean_query
+    return key
 
 
-def build_script_page_markup(page: int) -> InlineKeyboardMarkup:
+def build_search_keyboard(
+    results: list[dict],
+    query_key: str,
+    filter_code: str,
+    current_page: int,
+    total_pages: int,
+    total_count: int,
+) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
-    total_pages = max(1, (len(SCRIPT_KEYS_ORDER) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(1, min(page, total_pages))
 
-    start = (page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
-    for script_key in SCRIPT_KEYS_ORDER[start:end]:
-        title = SCRIPT_TITLES.get(script_key, script_key.title())
+    for doc in results:
+        doc_id = str(doc.get("_id"))
+        file_name = str(doc.get("file_name") or "Unknown File")
+        file_type = str(doc.get("file_type") or "ebook").lower()
+        prefix = "🎧" if file_type == "audiobook" else "📚"
+        button_label = f"{prefix} {file_name}"
+        if len(button_label) > 60:
+            button_label = button_label[:57] + "..."
+        markup.row(InlineKeyboardButton(text=button_label, callback_data=f"getfile:{doc_id}"))
+
+    ebook_target = "a" if filter_code == "e" else "e"
+    audio_target = "a" if filter_code == "u" else "u"
+    ebook_btn_text = "📚 ✅" if filter_code == "e" else "📚"
+    audio_btn_text = "🎧 ✅" if filter_code == "u" else "🎧"
+
+    markup.row(
+        InlineKeyboardButton(text=ebook_btn_text, callback_data=f"sfilt:{query_key}:{ebook_target}"),
+        InlineKeyboardButton(text=audio_btn_text, callback_data=f"sfilt:{query_key}:{audio_target}"),
+    )
+
+    if total_count <= 10 or total_pages <= 1:
+        markup.row(InlineKeyboardButton(text="1/1", callback_data="snoop"))
+    else:
+        prev_page = current_page - 1 if current_page > 1 else total_pages
+        next_page = current_page + 1 if current_page < total_pages else 1
         markup.row(
-            InlineKeyboardButton(
-                text=title,
-                callback_data=f"es:open:{script_key}",
+            InlineKeyboardButton(text="Back", callback_data=f"spage:{query_key}:{filter_code}:{prev_page}"),
+            InlineKeyboardButton(text=f"{current_page}/{total_pages}", callback_data="snoop"),
+            InlineKeyboardButton(text="Next", callback_data=f"spage:{query_key}:{filter_code}:{next_page}"),
+        )
+
+    return markup
+
+
+def format_search_header(query_text: str, filter_code: str, total_count: int, current_page: int, total_pages: int) -> str:
+    escaped_q = html.escape(query_text)
+    if filter_code == "e":
+        mode_label = "eBooks Only 📚"
+    elif filter_code == "u":
+        mode_label = "Audiobooks Only 🎧"
+    else:
+        mode_label = "All Formats (📚 & 🎧)"
+
+    if total_count == 0:
+        return (
+            f"🔍 <b>Search Query:</b> <code>{escaped_q}</code>\n"
+            f"<b>Filter:</b> {mode_label}\n\n"
+            f"<i>No matching files found for this filter.</i>"
+        )
+
+    return (
+        f"🔍 <b>Search Results for:</b> <code>{escaped_q}</code>\n"
+        f"<b>• Filter:</b> {mode_label}\n"
+        f"<b>• Total Found:</b> <code>{total_count}</code>\n"
+        f"<b>• Page:</b> <code>{current_page}/{total_pages}</code>\n\n"
+        f"<i>Select a file below to send it to the File Sharing Channel:</i>"
+    )
+
+
+async def auto_delete_messages(bot: AsyncTeleBot, chat_id: int, message_ids: list[int], delay_seconds: int) -> None:
+    await asyncio.sleep(delay_seconds)
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            print(f"[AUTO DELETE ERROR] Could not delete message {msg_id} in {chat_id}: {e}")
+
+
+def register_search_handler(bot: AsyncTeleBot) -> None:
+    @bot.message_handler(commands=["search"])
+    async def handle_search_command(message: Message):
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await send_script_message(
+                bot,
+                chat_id=message.chat.id,
+                script_key="search_usage",
+                context={
+                    "user_name": message.from_user.full_name if message.from_user else "User",
+                    "user_link": f"tg://user?id={message.from_user.id}" if message.from_user else "",
+                },
             )
-        )
-
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"es:page:{page - 1}")
-        )
-    nav_buttons.append(
-        InlineKeyboardButton(f"{page}/{total_pages}", callback_data="es:noop")
-    )
-    if page < total_pages:
-        nav_buttons.append(
-            InlineKeyboardButton("Next ➡️", callback_data=f"es:page:{page + 1}")
-        )
-    markup.row(*nav_buttons)
-    return markup
-
-
-def build_script_editor_markup(script_key: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("🖼 Media", callback_data=f"es:media:{script_key}"),
-        InlineKeyboardButton("✏️ Text", callback_data=f"es:text:{script_key}"),
-    )
-    markup.row(
-        InlineKeyboardButton("🔘 Buttons", callback_data=f"es:buttons:{script_key}"),
-        InlineKeyboardButton("👀 Preview", callback_data=f"es:preview:{script_key}"),
-    )
-    markup.row(
-        InlineKeyboardButton("↩️ Reset Default", callback_data=f"es:reset:{script_key}"),
-        InlineKeyboardButton("⬅️ Back", callback_data=f"es:page:1"),
-    )
-    return markup
-
-
-def build_media_menu(script_key: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("➕ Add Media", callback_data=f"es:media_add:{script_key}"),
-        InlineKeyboardButton("🗑 Clear Pool", callback_data=f"es:media_clear:{script_key}"),
-    )
-    markup.row(
-        InlineKeyboardButton("⬅️ Back", callback_data=f"es:open:{script_key}"),
-    )
-    return markup
-
-
-def build_button_menu(script_key: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("➕ Add Button Row", callback_data=f"es:buttons_add:{script_key}"),
-        InlineKeyboardButton("🗑 Clear Buttons", callback_data=f"es:buttons_clear:{script_key}"),
-    )
-    markup.row(
-        InlineKeyboardButton("⬅️ Back", callback_data=f"es:open:{script_key}"),
-    )
-    return markup
-
-
-async def show_script_list(bot: AsyncTeleBot, chat_id: int, page: int = 1) -> None:
-    page = max(1, page)
-    text = "<b>🧩 /editscript — Bot Script Manager</b>\n\nSelect a script to customize."
-    markup = build_script_page_markup(page)
-    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
-
-
-async def open_script_editor(bot: AsyncTeleBot, call: CallbackQuery, script_key: str) -> None:
-    title = SCRIPT_TITLES.get(script_key, script_key.title())
-    config = await get_script_config(script_key)
-    preview = config.get("text") or ""
-    preview = html.escape(preview)[:250]
-    text = (
-        f"<b>{title}</b>\n\n"
-        f"<i>Script Key:</i> <code>{html.escape(script_key)}</code>\n\n"
-        f"<i>Preview:</i>\n{preview or '<i>No custom text yet.</i>'}"
-    )
-    await bot.edit_message_text(
-        text=text,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=build_script_editor_markup(script_key),
-    )
-
-
-async def handle_text_edit(bot: AsyncTeleBot, message: Message, script_key: str) -> None:
-    new_text = (message.text or message.caption or "").strip()
-    if not new_text:
-        await bot.reply_to(message, "Please send the new script text.")
-        return
-
-    ok = await update_script_text(script_key, new_text, parse_mode="HTML")
-    if ok:
-        await bot.reply_to(
-            message,
-            f"✅ Saved custom text for <code>{html.escape(script_key)}</code>.",
-            parse_mode="HTML",
-        )
-    else:
-        await bot.reply_to(message, "Failed to save the text.")
-
-    ACTIVE_EDIT_SESSIONS.pop(message.from_user.id, None)
-
-
-async def handle_media_add(bot: AsyncTeleBot, message: Message, script_key: str) -> None:
-    file_id = None
-    media_type = None
-    duration = None
-
-    if getattr(message, "photo", None):
-        file_id = message.photo[-1].file_id
-        media_type = "photo"
-    elif getattr(message, "animation", None):
-        file_id = message.animation.file_id
-        media_type = "animation"
-        duration = getattr(message.animation, "duration", None)
-    elif getattr(message, "video", None):
-        file_id = message.video.file_id
-        media_type = "video"
-        duration = getattr(message.video, "duration", None)
-    else:
-        await bot.reply_to(message, "Please send a photo, GIF, or short video (<= 10 seconds).")
-        return
-
-    if media_type == "video" and duration is not None and duration > 10:
-        await bot.reply_to(
-            message,
-            "🚫 Video too long. Please send a video of 10 seconds or less.",
-            parse_mode="HTML",
-        )
-        return
-
-    ok, response = await add_script_media(
-        script_key=script_key,
-        file_id=file_id,
-        file_unique_id=message.message_id if not file_id else f"{script_key}:{file_id}",
-        media_type=media_type,
-        duration=duration,
-    )
-
-    if ok:
-        await bot.reply_to(message, response)
-    else:
-        await bot.reply_to(message, response)
-
-    ACTIVE_EDIT_SESSIONS.pop(message.from_user.id, None)
-
-
-async def handle_button_input(bot: AsyncTeleBot, message: Message, script_key: str) -> None:
-    payload = (message.text or "").strip()
-    if not payload:
-        await bot.reply_to(message, "Please send button data in this format:\n<code>Label|url|https://example.com</code>\nor\n<code>Label|cmd|cmd:start</code>", parse_mode="HTML")
-        return
-
-    parts = [p.strip() for p in payload.split("|")]
-    if len(parts) < 3:
-        await bot.reply_to(message, "Invalid format. Use: <code>Label|url|https://example.com</code>", parse_mode="HTML")
-        return
-
-    label, button_type, value = parts[0], parts[1].lower(), "|".join(parts[2:])
-    if button_type not in {"url", "cmd"}:
-        await bot.reply_to(message, "Button type must be <code>url</code> or <code>cmd</code>.", parse_mode="HTML")
-        return
-
-    button_row = [{"text": label, "type": button_type, "value": value}]
-    await add_script_button_row(script_key, button_row)
-    await bot.reply_to(message, f"✅ Added button row to <code>{html.escape(script_key)}</code>.", parse_mode="HTML")
-    ACTIVE_EDIT_SESSIONS.pop(message.from_user.id, None)
-
-
-async def send_script_preview(bot: AsyncTeleBot, call: CallbackQuery, script_key: str) -> None:
-    await send_script_message(
-        bot,
-        chat_id=call.message.chat.id,
-        script_key=script_key,
-        context={
-            "user_name": call.from_user.first_name if call.from_user else "User",
-            "username": call.from_user.username or "unknown",
-            "user_id": call.from_user.id if call.from_user else 0,
-            "user_link": f"tg://user?id={call.from_user.id}" if call.from_user else "",
-            "user_role": "owner" if is_admin_or_owner(call.from_user.id) else "admin",
-            "bot_name": "Mayank Bot",
-            "bot_username": "MayankBot",
-            "bot_link": "https://t.me/MayankBot",
-            "file_name": "Sample Book.epub",
-            "file_size": "12 MB",
-            "file_id": "sample_file_id",
-            "duration": "01:20",
-            "caption": "Preview caption",
-            "extension": "epub",
-            "file_type": "ebook",
-            "delete_minutes": "5",
-            "query": "Atomic Habits",
-            "total": "12",
-            "page": "1",
-            "total_pages": "2",
-            "fetched": "90",
-            "remaining": "15",
-            "forwarded": "75",
-            "duplicate": "5",
-            "deleted": "3",
-            "skipped": "7",
-            "filtered": "4",
-            "status": "preview",
-            "percentage": "80",
-            "footer": "preview",
-            "chat_title": call.message.chat.title or "Preview Chat",
-            "chat_id": call.message.chat.id,
-            "chat_username": call.message.chat.username or "previewchat",
-            "invite_link": "https://t.me/previewchat",
-            "topic_id": call.message.message_thread_id,
-            "permissions": "Administrator",
-            "action": "Preview",
-            "date_time": "Preview Time",
-        },
-    )
-
-
-def register_editscript_handler(bot: AsyncTeleBot) -> None:
-    @bot.message_handler(commands=["editscript"])
-    async def handle_editscript_command(message: Message):
-        if not message.from_user or not is_admin_or_owner(message.from_user.id):
-            await bot.reply_to(message, "🚫 Only Owners and Admins can use this command.")
-            return
-        await show_script_list(bot, message.chat.id, 1)
-
-    @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("es:"))
-    async def handle_editscript_callback(call: CallbackQuery):
-        if not call.from_user or not is_admin_or_owner(call.from_user.id):
-            await bot.answer_callback_query(call.id, "Access denied.", show_alert=True)
             return
 
-        data = call.data or ""
-        if data == "es:noop":
-            await bot.answer_callback_query(call.id)
+        query_text = parts[1].strip()
+        query_key = register_query_key(query_text)
+        filter_code = "a"
+
+        results, total_count, total_pages = await search_indexed_files(
+            query=query_text,
+            file_type=None,
+            page=1,
+            per_page=10,
+        )
+
+        if total_count == 0:
+            await send_script_message(
+                bot,
+                chat_id=message.chat.id,
+                script_key="search_no_results",
+                context={
+                    "query": query_text,
+                    "file_type": "All Formats",
+                },
+            )
             return
 
-        parts = data.split(":")
-        action = parts[1] if len(parts) > 1 else ""
+        header_text = format_search_header(
+            query_text=query_text,
+            filter_code=filter_code,
+            total_count=total_count,
+            current_page=1,
+            total_pages=total_pages,
+        )
+        keyboard = build_search_keyboard(
+            results=results,
+            query_key=query_key,
+            filter_code=filter_code,
+            current_page=1,
+            total_pages=total_pages,
+            total_count=total_count,
+        )
 
-        if action == "page":
-            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        await bot.reply_to(message, header_text, parse_mode="HTML", reply_markup=keyboard)
+
+    @bot.callback_query_handler(func=lambda call: call.data == "snoop")
+    async def handle_noop_callback(call: CallbackQuery):
+        await bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith(("spage:", "sfilt:")))
+    async def handle_search_navigation(call: CallbackQuery):
+        parts = call.data.split(":")
+        action = parts[0]
+
+        if action == "sfilt":
+            _, query_key, filter_code = parts
+            target_page = 1
+        else:
+            _, query_key, filter_code, page_str = parts
+            target_page = int(page_str)
+
+        query_text = SEARCH_QUERY_CACHE.get(query_key)
+        if not query_text:
+            await bot.answer_callback_query(call.id, "This search session expired. Please run /search again.", show_alert=True)
+            return
+
+        file_type = FILTER_CODE_TO_TYPE.get(filter_code)
+        results, total_count, total_pages = await search_indexed_files(
+            query=query_text,
+            file_type=file_type,
+            page=target_page,
+            per_page=10,
+        )
+
+        header_text = format_search_header(
+            query_text=query_text,
+            filter_code=filter_code,
+            total_count=total_count,
+            current_page=target_page if total_count > 0 else 1,
+            total_pages=total_pages,
+        )
+        keyboard = build_search_keyboard(
+            results=results,
+            query_key=query_key,
+            filter_code=filter_code,
+            current_page=target_page if total_count > 0 else 1,
+            total_pages=total_pages,
+            total_count=total_count,
+        )
+
+        try:
             await bot.edit_message_text(
-                text="<b>🧩 /editscript — Bot Script Manager</b>\n\nSelect a script to customize.",
+                text=header_text,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode="HTML",
-                reply_markup=build_script_page_markup(page),
+                reply_markup=keyboard,
             )
-            await bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+
+        await bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("getfile:"))
+    async def handle_file_selection(call: CallbackQuery):
+        record_id = call.data.split(":", 1)[1]
+        file_doc = await get_file_by_id(record_id)
+
+        if not file_doc:
+            await bot.answer_callback_query(call.id, "File not found in database.", show_alert=True)
             return
 
-        if action == "open":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await open_script_editor(bot, call, script_key)
-            await bot.answer_callback_query(call.id)
+        file_sharing_channel_id = getattr(settings, "FILE_SHARING_CHANNEL_ID", None)
+        index_channel_id = file_doc.get("db_channel_id") or getattr(settings, "INDEX_CHANNEL_ID", None)
+        db_message_id = file_doc.get("db_message_id")
+
+        if not file_sharing_channel_id:
+            await bot.answer_callback_query(call.id, "FILE_SHARING_CHANNEL_ID is not configured.", show_alert=True)
             return
 
-        if action == "media":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await bot.edit_message_text(
-                    text=f"<b>🖼 Media Manager</b>\n\nFor <code>{html.escape(script_key)}</code>.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=build_media_menu(script_key),
+        if not index_channel_id or not db_message_id:
+            await bot.answer_callback_query(call.id, "Source message details missing in database.", show_alert=True)
+            return
+
+        try:
+            forwarded_file_msg = await bot.forward_message(
+                chat_id=int(file_sharing_channel_id),
+                from_chat_id=int(index_channel_id),
+                message_id=int(db_message_id),
+            )
+
+            file_name = str(file_doc.get("file_name") or "Unknown")
+            file_size = str(file_doc.get("file_size") or 0)
+            duration = str(file_doc.get("duration") or "N/A")
+            delete_minutes = int(getattr(settings, "FILE_AUTO_DELETE_SECONDS", 300) or 300) // 60
+
+            notice_msg = await send_script_message(
+                bot,
+                chat_id=int(file_sharing_channel_id),
+                script_key="file_delivery",
+                context={
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "duration": duration,
+                    "delete_minutes": delete_minutes,
+                },
+                reply_to_message_id=forwarded_file_msg.message_id,
+            )
+
+            asyncio.create_task(
+                auto_delete_messages(
+                    bot=bot,
+                    chat_id=int(file_sharing_channel_id),
+                    message_ids=[forwarded_file_msg.message_id, notice_msg.message_id],
+                    delay_seconds=int(getattr(settings, "FILE_AUTO_DELETE_SECONDS", 300) or 300),
                 )
-            await bot.answer_callback_query(call.id)
-            return
+            )
 
-        if action == "text":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                ACTIVE_EDIT_SESSIONS[call.from_user.id] = {"type": "text", "script_key": script_key}
-                await bot.answer_callback_query(call.id, f"Send the new text for {script_key}.")
-                await bot.edit_message_text(
-                    text=f"<b>✏️ Edit Script Text</b>\n\nSend the new text for <code>{html.escape(script_key)}</code>.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=build_script_editor_markup(script_key),
-                )
-            return
-
-        if action == "buttons":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await bot.edit_message_text(
-                    text=f"<b>🔘 Button Manager</b>\n\nFor <code>{html.escape(script_key)}</code>.\n\nFormat: <code>Label|url|https://example.com</code> or <code>Label|cmd|cmd:start</code>",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=build_button_menu(script_key),
-                )
-            await bot.answer_callback_query(call.id)
-            return
-
-        if action == "preview":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await send_script_preview(bot, call, script_key)
-            await bot.answer_callback_query(call.id, "Preview sent.")
-            return
-
-        if action == "reset":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await reset_script_to_default(script_key)
-                await bot.answer_callback_query(call.id, f"Reset {script_key} to default.", show_alert=True)
-                await open_script_editor(bot, call, script_key)
-            return
-
-        if action == "media_add":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                ACTIVE_EDIT_SESSIONS[call.from_user.id] = {"type": "media", "script_key": script_key}
-                await bot.answer_callback_query(call.id, "Send a photo, GIF, or short video to add to this script.")
-                await bot.edit_message_text(
-                    text=f"<b>🖼 Add Media</b>\n\nSend a photo, GIF, or video (<=10s) for <code>{html.escape(script_key)}</code>.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=build_media_menu(script_key),
-                )
-            return
-
-        if action == "media_clear":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await clear_script_media(script_key)
-                await bot.answer_callback_query(call.id, f"Cleared media pool for {script_key}.", show_alert=True)
-                await open_script_editor(bot, call, script_key)
-            return
-
-        if action == "buttons_add":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                ACTIVE_EDIT_SESSIONS[call.from_user.id] = {"type": "buttons", "script_key": script_key}
-                await bot.answer_callback_query(call.id, "Send button data in the format Label|url|https://... or Label|cmd|cmd:start")
-                await bot.edit_message_text(
-                    text=f"<b>🔘 Add Button Row</b>\n\nSend one row in the format:<code>Label|url|https://example.com</code> or <code>Label|cmd|cmd:start</code>.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="HTML",
-                    reply_markup=build_button_menu(script_key),
-                )
-            return
-
-        if action == "buttons_clear":
-            script_key = parts[2] if len(parts) > 2 else None
-            if script_key:
-                await clear_script_buttons(script_key)
-                await bot.answer_callback_query(call.id, f"Cleared buttons for {script_key}.", show_alert=True)
-                await open_script_editor(bot, call, script_key)
-            return
-
-        if action == "back":
-            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-            await show_script_list(bot, call.message.chat.id, page)
-            await bot.answer_callback_query(call.id)
-            return
-
-    @bot.message_handler(
-        func=lambda message: message.from_user is not None and message.from_user.id in ACTIVE_EDIT_SESSIONS
-    )
-    async def handle_script_edit_input(message: Message):
-        user_id = message.from_user.id
-        session = ACTIVE_EDIT_SESSIONS.get(user_id)
-        if not session:
-            return
-
-        session_type = session.get("type")
-        script_key = session.get("script_key")
-        if not script_key:
-            ACTIVE_EDIT_SESSIONS.pop(user_id, None)
-            return
-
-        if session_type == "text":
-            await handle_text_edit(bot, message, script_key)
-            return
-
-        if session_type == "media":
-            await handle_media_add(bot, message, script_key)
-            return
-
-        if session_type == "buttons":
-            await handle_button_input(bot, message, script_key)
-            return
-
-
-__all__ = ["register_editscript_handler"]
+            await bot.answer_callback_query(
+                call.id,
+                "File has been sent to the File Sharing Channel! It will be deleted in 5 minutes.",
+                show_alert=True,
+            )
+        except Exception as e:
+            print(f"[FILE DELIVERY ERROR] {e}")
+            await bot.answer_callback_query(
+                call.id,
+                "Failed to forward file to the File Sharing Channel. Check bot permissions.",
+                show_alert=True,
+            )
