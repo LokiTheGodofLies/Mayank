@@ -33,27 +33,42 @@ async def is_file_already_indexed(file_unique_id: str) -> dict | None:
     return await files_collection.find_one({"file_unique_id": file_unique_id})
 
 
+async def update_indexed_file_channel_msg(
+    file_unique_id: str,
+    db_channel_id: int,
+    db_message_id: int,
+    new_file_id: str | None = None,
+) -> bool:
+    """
+    Updates the Telegram Index Channel message ID (db_message_id) in MongoDB
+    when a previously indexed file was missing/deleted from INDEX_CHANNEL_ID
+    and had to be re-forwarded during Dual-Check /index.
+    """
+    if not file_unique_id:
+        return False
+
+    update_fields: dict = {
+        "db_channel_id": int(db_channel_id),
+        "db_message_id": int(db_message_id),
+        "updated_at": get_ist_time(),
+    }
+    if new_file_id:
+        update_fields["file_id"] = new_file_id
+
+    try:
+        await files_collection.update_one(
+            {"file_unique_id": file_unique_id},
+            {"$set": update_fields},
+        )
+        return True
+    except Exception as e:
+        print(f"[FILES_DB UPDATE MSG ERROR] {e}")
+        return False
+
+
 async def save_indexed_file(file_data: dict) -> tuple[bool, dict]:
     """
-    Saves or updates an indexed eBook or Audiobook record in MongoDB.
-
-    Stored fields:
-        - file_unique_id (str)
-        - file_id (str)
-        - file_name (str)
-        - file_size (int)
-        - caption (str)
-        - duration (int | None)
-        - file_extension (str)
-        - file_type (str): 'ebook' or 'audiobook'
-        - db_channel_id (int)
-        - db_message_id (int)
-        - source_chat_id (int)
-        - source_chat_title (str)
-        - source_chat_username (str | None)
-        - source_message_id (int)
-        - is_direct_upload (bool)
-        - indexed_at (str)
+    Saves an indexed eBook or Audiobook record in MongoDB.
     Returns (is_new_insert, document).
     """
     now_ist = get_ist_time()
@@ -78,6 +93,7 @@ async def save_indexed_file(file_data: dict) -> tuple[bool, dict]:
         "source_chat_title": file_data.get("source_chat_title") or "Unknown Chat",
         "source_chat_username": file_data.get("source_chat_username"),
         "source_message_id": file_data.get("source_message_id"),
+        "topic_id": file_data.get("topic_id"),
         "is_direct_upload": bool(file_data.get("is_direct_upload", False)),
         "indexed_at": now_ist,
     }
@@ -115,7 +131,6 @@ def _build_word_to_word_filter(query: str, file_type: str | None = None, strict_
     for word in words:
         escaped = re.escape(word)
         if strict_boundaries:
-            # Matches whole word separated by spaces, punctuation, underscores, hyphens, or dots
             pattern = rf"(?<![a-zA-Z0-9]){escaped}(?![a-zA-Z0-9])"
         else:
             pattern = escaped
@@ -148,19 +163,14 @@ async def search_indexed_files(
 ) -> tuple[list[dict], int, int]:
     """
     Performs word-to-word search across file_name and caption.
-    - file_type: None (all), 'ebook' (📚 only), or 'audiobook' (🎧 only)
-    - page: 1-based page number
-    - per_page: 10 results per page
     Returns (results_for_page, total_matching_files, total_pages).
     """
     if not query or not query.strip():
         return [], 0, 1
 
-    # 1. Try strict word-to-word boundary match first
     mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=True)
     total_count = await files_collection.count_documents(mongo_filter)
 
-    # 2. Fallback to flexible word match if strict word boundaries returned 0 results
     if total_count == 0:
         mongo_filter = _build_word_to_word_filter(query, file_type=file_type, strict_boundaries=False)
         total_count = await files_collection.count_documents(mongo_filter)
