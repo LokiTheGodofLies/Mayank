@@ -10,6 +10,7 @@ from telebot.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 import config.settings as settings
 from config.strings import DEFAULT_SCRIPTS
 from database.files_database.files_db import (
+    get_file_by_unique_id,
     is_file_already_indexed,
     save_indexed_file,
     update_indexed_file_channel_msg,
@@ -35,8 +36,8 @@ MIME_TO_EXT = {
 }
 
 _INDEX_BATCH_SIZE = 10
-_INDEX_BATCH_COOLDOWN_SECONDS = 10
-_INDEX_FORWARD_DELAY_SECONDS = 3
+_INDEX_BATCH_PAUSE_SECONDS = 10
+_INDEX_FILE_DELAY_SECONDS = 3
 
 _BOT_ID_CACHE: int | None = None
 
@@ -82,6 +83,7 @@ async def wait_for_flood_or_retry(exc: Exception, *, default_wait: int = 5) -> b
         except ValueError:
             retry_after = default_wait
 
+    # Stop the current batch immediately. The queue will resume later with the remaining files.
     await asyncio.sleep(retry_after)
     return True
 
@@ -187,6 +189,80 @@ def extract_sender_details(message: Message) -> dict:
     }
 
 
+def caption_has_metadata(caption: str | None, book_meta: dict | None) -> bool:
+    """Returns True if the caption already has metadata-like content; otherwise the file is repaired first."""
+    text = (caption or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    keyword_hits = (
+        "title",
+        "author",
+        "genre",
+        "pages",
+        "rating",
+        "isbn",
+        "published",
+        "year",
+        "book",
+    )
+    if any(keyword in lowered for keyword in keyword_hits):
+        return True
+
+    if isinstance(book_meta, dict):
+        values = [book_meta.get("book_title"), book_meta.get("book_author"), book_meta.get("isbn")]
+        if any(value and str(value).strip() for value in values):
+            return True
+
+    return False
+
+
+def build_metadata_caption(media_info: dict, book_meta: dict | None = None) -> str:
+    """Builds a fallback metadata caption when Goodreads-style details are missing."""
+    title = (book_meta or {}).get("book_title") or media_info.get("file_name") or "Unknown Book"
+    author = (book_meta or {}).get("book_author") or "Unknown Author"
+    file_type = (media_info.get("file_type") or "ebook").upper()
+    extension = (media_info.get("file_extension") or "").upper() or "FILE"
+    size = media_info.get("file_size", 0) or 0
+    duration = media_info.get("duration")
+
+    lines = [
+        f"<b>{html.escape(str(title))}</b>",
+        f"<b>Author:</b> {html.escape(str(author))}",
+        f"<b>Type:</b> {html.escape(file_type)}",
+        f"<b>Extension:</b> <code>{html.escape(extension)}</code>",
+        f"<b>Size:</b> <code>{size}</code> bytes",
+    ]
+    if duration:
+        lines.append(f"<b>Duration:</b> <code>{duration}</code>")
+
+    return "\n".join(lines)
+
+
+async def ensure_file_metadata_caption(bot: AsyncTeleBot, message: Message, media_info: dict) -> bool:
+    """Ensures the stored file record has a metadata caption before considering it fully indexed."""
+    file_unique_id = media_info.get("file_unique_id") or media_info.get("file_id")
+    if not file_unique_id:
+        return False
+
+    record = await get_file_by_unique_id(file_unique_id)
+    if not record:
+        return False
+
+    caption = record.get("caption") or ""
+    book_meta = record.get("book_meta") or {}
+    if caption_has_metadata(caption, book_meta):
+        return True
+
+    fallback_caption = build_metadata_caption(media_info, book_meta)
+    record["caption"] = fallback_caption
+    record["book_meta"] = book_meta
+    record["updated_at"] = get_ist_time()
+    await save_indexed_file(record)
+    return True
+
+
 async def process_single_file_dual_check(
     bot: AsyncTeleBot,
     message: Message,
@@ -216,6 +292,7 @@ async def process_single_file_dual_check(
     if existing_doc:
         recorded_msg_id = existing_doc.get("db_message_id")
         if is_direct_upload:
+            await ensure_file_metadata_caption(bot, message, media_info)
             return "duplicate"
 
         still_in_channel = await verify_msg_exists_in_index_channel(
@@ -224,6 +301,7 @@ async def process_single_file_dual_check(
             db_message_id=recorded_msg_id,
         )
         if still_in_channel:
+            await ensure_file_metadata_caption(bot, message, media_info)
             return "duplicate"
 
         try:
@@ -240,6 +318,7 @@ async def process_single_file_dual_check(
                 db_message_id=forwarded_msg.message_id,
                 new_file_id=new_file_id,
             )
+            await ensure_file_metadata_caption(bot, message, media_info)
             return "forwarded"
         except Exception as e:
             if await wait_for_flood_or_retry(e):
@@ -254,6 +333,7 @@ async def process_single_file_dual_check(
             )
             return "error"
 
+    # Missing from MongoDB or not yet indexed
     db_channel_username = None
     if is_direct_upload:
         db_message_id = message.message_id
@@ -297,6 +377,8 @@ async def process_single_file_dual_check(
     }
 
     is_inserted, saved_doc = await save_indexed_file(record_to_save)
+    await ensure_file_metadata_caption(bot, message, media_info)
+
     if is_inserted and send_log:
         sender_info = extract_sender_details(message) if is_direct_upload else {}
         log_payload = {
@@ -405,7 +487,7 @@ async def process_index_batch(
     status_msg: Message | None = None,
     job_id: int | None = None,
 ) -> dict:
-    """Safely batches indexing with a max burst of 10 items and cooldown windows to avoid Telegram rate limits."""
+    """Safely processes files one-by-one with a max burst of 10 items and a 10s pause after each batch."""
     stats = {
         "total_messages": last_msg_id,
         "fetched": 0,
@@ -472,6 +554,16 @@ async def process_index_batch(
         probed_msg.chat = chat_obj
         probed_msg.message_id = msg_id
 
+        # Enforce the rule: every file must exist in the index channel, in MongoDB, and have a metadata caption.
+        # If any check fails, repair that file first and do not move to the next one.
+        repaired = await ensure_file_metadata_caption(bot, probed_msg, extract_media_info(probed_msg) or {})
+        if not repaired:
+            # If the file is unsupported, skip it cleanly.
+            if not extract_media_info(probed_msg):
+                stats["filtered"] += 1
+                await asyncio.sleep(_INDEX_FILE_DELAY_SECONDS)
+                continue
+
         outcome = await process_single_file_dual_check(bot, probed_msg, send_log=True)
         if outcome == "forwarded":
             stats["forwarded"] += 1
@@ -480,10 +572,11 @@ async def process_index_batch(
         else:
             stats["filtered"] += 1
 
+        # A strict single-file queue: process one file completely before continuing.
+        await asyncio.sleep(_INDEX_FILE_DELAY_SECONDS)
+
         if stats["fetched"] % _INDEX_BATCH_SIZE == 0 and msg_id != last_msg_id:
-            await asyncio.sleep(_INDEX_BATCH_COOLDOWN_SECONDS)
-        else:
-            await asyncio.sleep(_INDEX_FORWARD_DELAY_SECONDS)
+            await asyncio.sleep(_INDEX_BATCH_PAUSE_SECONDS)
 
         if stats["fetched"] % 15 == 0 or stats["fetched"] == last_msg_id:
             try:
