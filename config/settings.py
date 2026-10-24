@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # MongoDB Configuration
 MONGO_URL = os.getenv("MONGO_URL", "")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "MayankBotDB")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "telegram_bot_db")
 
 # Roles & Permissions
 OWNER_IDS = parse_id_list(os.getenv("OWNER_IDS", ""))
@@ -41,19 +41,20 @@ ADMIN_IDS = parse_id_list(os.getenv("ADMIN_IDS", ""))
 
 # Log Group & Forum Topic IDs
 LOG_GROUP_ID = parse_optional_int(os.getenv("LOG_GROUP_ID"), None)
-USER_LOG_TOPIC_ID = parse_optional_int(os.getenv("USER_LOG_TOPIC_ID"), None)
-CHANNEL_LOG_TOPIC_ID = parse_optional_int(os.getenv("CHANNEL_LOG_TOPIC_ID"), None)
-GROUP_LOG_TOPIC_ID = parse_optional_int(os.getenv("GROUP_LOG_TOPIC_ID"), None)
-INDEX_LOG_TOPIC_ID = parse_optional_int(os.getenv("INDEX_LOG_TOPIC_ID"), None)
+USER_LOG_TOPIC_ID = parse_optional_int(os.getenv("USER_LOG_TOPIC_ID"), 5)
+GROUP_LOG_TOPIC_ID = parse_optional_int(os.getenv("GROUP_LOG_TOPIC_ID"), 18)
+CHANNEL_LOG_TOPIC_ID = parse_optional_int(os.getenv("CHANNEL_LOG_TOPIC_ID"), 19)
+INDEX_LOG_TOPIC_ID = parse_optional_int(os.getenv("INDEX_LOG_TOPIC_ID"), 32)
+ERROR_LOG_TOPIC_ID = parse_optional_int(os.getenv("ERROR_LOG_TOPIC_ID"), 35)
 
 # File Indexer & File Sharing Channels
 INDEX_CHANNEL_ID = parse_optional_int(os.getenv("INDEX_CHANNEL_ID"), None)
 FILE_SHARING_CHANNEL_ID = parse_optional_int(os.getenv("FILE_SHARING_CHANNEL_ID"), None)
 FILE_AUTO_DELETE_SECONDS = parse_optional_int(os.getenv("FILE_AUTO_DELETE_SECONDS"), 300)
 
-# Supported Book & Audiobook Formats
+# Supported Book & Audiobook Formats (.epub, .pdf, .azw3, .kfx, .mp3, .m4b, .aax, .zip)
 EBOOK_EXTENSIONS = {"epub", "pdf", "azw3", "kfx"}
-AUDIOBOOK_EXTENSIONS = {"mp3", "m4b", "aax"}
+AUDIOBOOK_EXTENSIONS = {"mp3", "m4b", "aax", "zip"}
 ALLOWED_EXTENSIONS = EBOOK_EXTENSIONS | AUDIOBOOK_EXTENSIONS
 
 # Web Server & Deployment
@@ -68,7 +69,8 @@ def apply_config_overrides(overrides: dict) -> None:
     """
     global API_ID, API_HASH, BOT_TOKEN, MONGO_URL, DATABASE_NAME
     global OWNER_IDS, ADMIN_IDS
-    global LOG_GROUP_ID, USER_LOG_TOPIC_ID, CHANNEL_LOG_TOPIC_ID, GROUP_LOG_TOPIC_ID, INDEX_LOG_TOPIC_ID
+    global LOG_GROUP_ID, USER_LOG_TOPIC_ID, GROUP_LOG_TOPIC_ID, CHANNEL_LOG_TOPIC_ID
+    global INDEX_LOG_TOPIC_ID, ERROR_LOG_TOPIC_ID
     global INDEX_CHANNEL_ID, FILE_SHARING_CHANNEL_ID, FILE_AUTO_DELETE_SECONDS
     global PORT, RENDER_DEPLOY_HOOK_URL
 
@@ -88,10 +90,11 @@ def apply_config_overrides(overrides: dict) -> None:
     ADMIN_IDS = parse_id_list(os.getenv("ADMIN_IDS", ""))
 
     LOG_GROUP_ID = parse_optional_int(os.getenv("LOG_GROUP_ID"), None)
-    USER_LOG_TOPIC_ID = parse_optional_int(os.getenv("USER_LOG_TOPIC_ID"), None)
-    CHANNEL_LOG_TOPIC_ID = parse_optional_int(os.getenv("CHANNEL_LOG_TOPIC_ID"), None)
-    GROUP_LOG_TOPIC_ID = parse_optional_int(os.getenv("GROUP_LOG_TOPIC_ID"), None)
-    INDEX_LOG_TOPIC_ID = parse_optional_int(os.getenv("INDEX_LOG_TOPIC_ID"), None)
+    USER_LOG_TOPIC_ID = parse_optional_int(os.getenv("USER_LOG_TOPIC_ID"), 5)
+    GROUP_LOG_TOPIC_ID = parse_optional_int(os.getenv("GROUP_LOG_TOPIC_ID"), 18)
+    CHANNEL_LOG_TOPIC_ID = parse_optional_int(os.getenv("CHANNEL_LOG_TOPIC_ID"), 19)
+    INDEX_LOG_TOPIC_ID = parse_optional_int(os.getenv("INDEX_LOG_TOPIC_ID"), 32)
+    ERROR_LOG_TOPIC_ID = parse_optional_int(os.getenv("ERROR_LOG_TOPIC_ID"), 35)
 
     INDEX_CHANNEL_ID = parse_optional_int(os.getenv("INDEX_CHANNEL_ID"), None)
     FILE_SHARING_CHANNEL_ID = parse_optional_int(os.getenv("FILE_SHARING_CHANNEL_ID"), None)
