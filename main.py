@@ -6,10 +6,8 @@ from functions.help.help_handler import register_help_handler
 from functions.start_function.start_handler import register_start_handler
 from functions.chat_tracker.tracker_handler import register_chat_tracker_handler
 from functions.admin_config.var_manager import register_var_manager_handler
-from functions.admin_config.redeploy_manager import register_redeploy_handler
 from functions.indexer.indexer_handler import register_indexer_handler
 from functions.search_function.search_handler import register_search_handler
-from functions.script_engine.editscript_handler import register_editscript_handler
 from functions.ban_handler import register_ban_handler
 from server.web_server import start_web_server
 from database.config_database.config_db import get_all_config_vars
@@ -44,11 +42,9 @@ async def main() -> None:
 
     register_start_handler(bot)
     register_chat_tracker_handler(bot)
-    register_redeploy_handler(bot)
     register_var_manager_handler(bot)
     register_indexer_handler(bot)
     register_search_handler(bot)
-    register_editscript_handler(bot)
     register_ban_handler(bot)
     register_help_handler(bot)
 
