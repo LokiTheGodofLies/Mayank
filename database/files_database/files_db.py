@@ -63,6 +63,19 @@ async def is_file_already_indexed(file_unique_id: str) -> bool:
     record = await db["files_database"].find_one({"file_unique_id": file_unique_id}, {"_id": 1})
     return record is not None
 
+async def update_indexed_file_channel_msg(file_unique_id: str, channel_id: int, message_id: int) -> bool:
+    """Updates or links a channel message ID and channel ID to an existing indexed file record."""
+    if db is None or not file_unique_id:
+        return False
+    
+    collection = db["files_database"]
+    result = await collection.update_one(
+        {"file_unique_id": file_unique_id},
+        {"$set": {"channel_id": channel_id, "channel_message_id": message_id}}
+    )
+    return result.modified_count > 0
+    
+
 async def save_indexed_file(record: dict) -> tuple[bool, dict]:
     """
     Saves or updates an indexed file in files_database using file_unique_id.
