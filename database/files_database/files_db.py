@@ -5,9 +5,10 @@ from database.connection import db
 # Indian Standard Time (IST = UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def get_ist_time():
-    """Returns the current datetime in Indian Standard Time (IST)."""
-    return datetime.now(IST)
+def get_ist_time() -> str:
+    """Returns the current timestamp formatted in Indian Standard Time (IST)."""
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
 
 def format_file_size(size_bytes: int | None) -> str:
     """Formats raw bytes into human-readable KB / MB / GB."""
