@@ -56,6 +56,12 @@ async def get_file_by_unique_id(file_unique_id: str) -> dict | None:
         return None
     return await db["files_database"].find_one({"file_unique_id": file_unique_id})
 
+async def is_file_already_indexed(file_unique_id: str) -> bool:
+    """Checks if a file record already exists in the database by its unique ID."""
+    if db is None or not file_unique_id:
+        return False
+    record = await db["files_database"].find_one({"file_unique_id": file_unique_id}, {"_id": 1})
+    return record is not None
 
 async def save_indexed_file(record: dict) -> tuple[bool, dict]:
     """
