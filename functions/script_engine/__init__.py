@@ -7,7 +7,7 @@ from database.config_database.config_db import get_all_config_vars
 from database.files_database.files_db import init_files_db_indexes
 from database.scripts_database.scripts_db import init_scripts_db_indexes
 from functions.admin_config.redeploy_manager import register_redeploy_handler
-from functions.admin_config.var_manager import register_var_manager_handler
+from functions.admin_config.var_manager import register_redeploy_handler
 from functions.chat_tracker.tracker_handler import register_chat_tracker_handler
 from functions.error_logger.error_log_sender import verify_startup_configuration
 from functions.indexer.indexer_handler import register_indexer_handler
